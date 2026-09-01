@@ -22,12 +22,43 @@ const SHARED_SECRET = process.env.SHARED_SECRET || '';
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const TIMEOUT_MS = 90_000; // yt-dlp can take a while on age-gated content
 
+// Allowed Instagram domains for SSRF protection.
+const ALLOWED_HOSTS = new Set([
+  'instagram.com',
+  'www.instagram.com',
+  'instagr.am',
+  'www.instagr.am',
+]);
+
 // Simple shared-secret auth. Set SHARED_SECRET in Render env vars to match
 // the IG_DOWNLOADER_SECRET in Base44. If SHARED_SECRET is empty, auth is
 // disabled (fine for testing, lock it down for production).
 app.use((req, res, next) => {
   if (SHARED_SECRET && req.headers['x-shared-secret'] !== SHARED_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+});
+
+// Rate limiting: 200 requests per hour per IP. Covers 3 admins × 30 URLs
+// with headroom. In-memory (fine for a single-instance Render service).
+const RATE_LIMIT_MAX = 200;
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const rateBuckets = new Map(); // ip → { count, resetAt }
+
+app.use((req, res, next) => {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  let bucket = rateBuckets.get(ip);
+  if (!bucket || now > bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    rateBuckets.set(ip, bucket);
+  }
+  bucket.count++;
+  if (bucket.count > RATE_LIMIT_MAX) {
+    const retryAfter = Math.ceil((bucket.resetAt - now) / 1000);
+    res.setHeader('Retry-After', String(retryAfter));
+    return res.status(429).json({ error: `Rate limit exceeded: ${RATE_LIMIT_MAX} requests/hour. Retry in ${retryAfter}s.` });
   }
   next();
 });
@@ -48,6 +79,20 @@ app.post('/fetch', async (req, res) => {
   const { url, cookie } = req.body || {};
   if (!url || typeof url !== 'string') {
     return res.status(400).json({ error: 'url is required' });
+  }
+
+  // SSRF protection: only allow Instagram URLs.
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return res.status(400).json({ error: 'Invalid URL' });
+  }
+  if (!ALLOWED_HOSTS.has(parsedUrl.hostname.toLowerCase())) {
+    return res.status(403).json({ error: `Blocked: only Instagram URLs are allowed (got ${parsedUrl.hostname})` });
+  }
+  if (parsedUrl.protocol !== 'https:') {
+    return res.status(400).json({ error: 'Only HTTPS URLs are allowed' });
   }
 
   // Write the cookie to a temp Netscape-format file if provided.

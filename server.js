@@ -170,6 +170,78 @@ app.post('/fetch', async (req, res) => {
   }
 });
 
+// --- Overlay burn-in (ffmpeg) ---
+// Burn a transparent overlay PNG onto a video. The PNG is pre-rendered
+// client-side (pixel-perfect Google fonts) and uploaded to Base44 storage;
+// this endpoint downloads both, scales the PNG to the video dimensions,
+// overlays it, and streams the burned MP4 back. Used by the burnReelOverlay
+// backend function so the reel export ships with the text overlay actually
+// IN the video — the client-side canvas bake only produces a still cover.
+const ALLOWED_BURN_HOSTS = (h) => {
+  const x = (h || '').toLowerCase();
+  return x.endsWith('base44.app') || x.endsWith('wixstatic.com') || x === 'media.base44.com';
+};
+
+function downloadToFile(url, dest) {
+  return fetch(url).then((r) => {
+    if (!r.ok) throw new Error(`download ${r.status}`);
+    return r.arrayBuffer();
+  }).then((ab) => fs.writeFileSync(dest, Buffer.from(ab)));
+}
+
+function probeDims(file) {
+  return new Promise((resolve, reject) => {
+    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file], (err, stdout) => {
+      if (err) return reject(err);
+      const parts = (stdout || '').trim().split(',');
+      resolve({ w: Number(parts[0]), h: Number(parts[1]) });
+    });
+  });
+}
+
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    execFile('ffmpeg', args, { timeout: 120_000, maxBuffer: 8 * 1024 * 1024 }, (err, _stdout, stderr) => {
+      if (err) return reject(new Error((stderr || err.message).slice(-800)));
+      resolve();
+    });
+  });
+}
+
+app.post('/burn-overlay', async (req, res) => {
+  const { video_url, overlay_png_url } = req.body || {};
+  if (!video_url || !overlay_png_url) return res.status(400).json({ error: 'video_url and overlay_png_url are required' });
+  let vUrl, pUrl;
+  try { vUrl = new URL(video_url); pUrl = new URL(overlay_png_url); }
+  catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  if (!ALLOWED_BURN_HOSTS(vUrl.hostname) || !ALLOWED_BURN_HOSTS(pUrl.hostname)) {
+    return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'burn-'));
+  const videoFile = path.join(dir, 'in.mp4');
+  const pngFile = path.join(dir, 'overlay.png');
+  const outFile = path.join(dir, 'out.mp4');
+  try {
+    await downloadToFile(video_url, videoFile);
+    await downloadToFile(overlay_png_url, pngFile);
+    const { w, h } = await probeDims(videoFile);
+    if (!w || !h) throw new Error('Could not probe video dimensions');
+    await runFfmpeg([
+      '-y', '-i', videoFile, '-i', pngFile,
+      '-filter_complex', `[1]scale=${w}:${h}[png];[0][png]overlay=0:0`,
+      '-c:a', 'copy', '-movflags', '+faststart',
+      outFile,
+    ]);
+    const buf = fs.readFileSync(outFile);
+    res.setHeader('Content-Type', 'video/mp4');
+    return res.send(buf);
+  } catch (e) {
+    return res.status(500).json({ error: e.message || 'burn-overlay failed' });
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
 // Health check for Render.
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 

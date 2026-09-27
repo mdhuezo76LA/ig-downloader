@@ -219,5 +219,11 @@ def health():
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5001))
-    app.run(host='0.0.0.0', port=port)
+    # Flask binds to a FIXED internal port (FLASK_PORT=5001), NEVER to $PORT.
+    # On Render, $PORT (e.g. 10000) is the external port Node/Express binds to.
+    # If Flask also reads $PORT, both processes collide and Flask crashes with
+    # "Address already in use" — Node wins the race, Flask dies, and the
+    # /verify-arcface /verify-adaface proxy routes hit nothing. Binding to
+    # 127.0.0.1 keeps Flask internal-only (Node proxies to localhost:5001).
+    port = int(os.environ.get('FLASK_PORT', 5001))
+    app.run(host='127.0.0.1', port=port)

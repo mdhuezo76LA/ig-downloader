@@ -1,0 +1,6 @@
+flask
+insightface
+onnxruntime
+numpy
+pillow
+requests

@@ -533,8 +533,26 @@ async function proxyToFlask(req, res, path) {
       headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': req.headers['x-admin-secret'] || '' },
       body: JSON.stringify(req.body || {}),
     });
-    const data = await r.json().catch(() => ({ error: 'Flask returned non-JSON' }));
-    return res.status(r.status).json(data);
+    const text = await r.text();
+    try {
+      const data = JSON.parse(text);
+      return res.status(r.status).json(data);
+    } catch {
+      // Flask returned non-JSON (HTML error page). Include diagnostic info:
+      // the Flask HTTP status, content-type, and a sanitized snippet of
+      // the response body (last 800 chars — where the Python traceback is).
+      // Strip any line that might contain secrets (admin-secret headers).
+      const rawSnippet = text.slice(-800)
+        .split('\n')
+        .filter(line => !/admin.?secret|shared.?secret|x-admin/i.test(line))
+        .join('\n');
+      return res.status(r.status).json({
+        error: 'Flask returned non-JSON',
+        flask_status: r.status,
+        flask_content_type: r.headers.get('content-type'),
+        flask_body_snippet: rawSnippet,
+      });
+    }
   } catch (e) {
     return res.status(502).json({ error: `Identity model service unavailable: ${e.message}` });
   }

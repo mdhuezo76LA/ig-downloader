@@ -58,43 +58,36 @@ def get_arcface():
     return _arcface_app
 
 
-# --- AdaFace (IR-101) ---
-# AdaFace IR-101 backbone. The architecture is a modified IR-SE-101 with
-# the AdaFace loss head. We load the pretrained weights from the AdaFace
-# GitHub releases and use the backbone for embedding extraction.
-# Download URL: https://github.com/mttrits/AdaFace/releases/download/v1/adaface_ir101_webface4m.pth
+# --- AdaFace (buffalo_s w600k_mbf / MobileFaceNet) ---
+# Uses InsightFace's buffalo_s pack which includes w600k_mbf (MobileFaceNet).
+# This is architecturally DIFFERENT from buffalo_l's w600k_r50 (ResNet50) —
+# different network, different embeddings, independent ensemble vote.
+# Both use ONNX Runtime via insightface — no PyTorch needed.
+#
+# FALLBACK: If buffalo_s fails to download/load (Render env issue, GitHub
+# rate limit, missing pack), we fall back to buffalo_l (degraded mode).
+# In degraded mode, AdaFace uses the same model as ArcFace but with a
+# stricter threshold (0.78 vs 0.74). The ensemble check is still 3-check
+# but the AdaFace vote is NOT independent. The 'degraded' flag is returned
+# in the response so the ensemble check can log it.
 
-ADAFACE_WEIGHTS_PATH = os.environ.get('ADAFACE_WEIGHTS_PATH', '/app/models/adaface_ir101_webface4m.pth')
-ADAFACE_DOWNLOAD_URL = 'https://github.com/mttrits/AdaFace/releases/download/v1/adaface_ir101_webface4m.pth'
-_adaface_model = None
-
-class AdaFaceIR101:
-    """IR-101 backbone via InsightFace model zoo (ONNX Runtime, no PyTorch)."""
-    def __init__(self):
-        from insightface.model_zoo import get_model
-        self.model = get_model('w600k_mbf.onnx')
-        self.model.prepare(ctx_id=-1)
-
-    def get_feat(self, img):
-        return self.model.get_feat(img)
+_adaface_app = None
+_adaface_degraded = False
 
 def get_adaface():
-    global _adaface_model
-    if _adaface_model is None:
-        # Download weights if not present
-        if not os.path.exists(ADAFACE_WEIGHTS_PATH):
-            os.makedirs(os.path.dirname(ADAFACE_WEIGHTS_PATH), exist_ok=True)
-            try:
-                resp = requests.get(ADAFACE_DOWNLOAD_URL, timeout=120, stream=True)
-                resp.raise_for_status()
-                with open(ADAFACE_WEIGHTS_PATH, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        f.write(chunk)
-            except Exception as e:
-                print(f'AdaFace weights download failed: {e}')
-                raise
-        _adaface_model = AdaFaceIR101()
-    return _adaface_model
+    global _adaface_app, _adaface_degraded
+    if _adaface_app is None:
+        try:
+            print('[AdaFace] Loading buffalo_s pack (w600k_mbf MobileFaceNet)...', flush=True)
+            _adaface_app = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider'])
+            _adaface_app.prepare(ctx_id=-1, det_size=(640, 640))
+            print('[AdaFace] buffalo_s loaded successfully — independent ensemble vote active', flush=True)
+        except Exception as e:
+            print(f'[AdaFace] WARNING: buffalo_s failed: {e}', flush=True)
+            print(f'[AdaFace] Falling back to buffalo_l (degraded mode — NOT independent)', flush=True)
+            _adaface_app = get_arcface()
+            _adaface_degraded = True
+    return _adaface_app
 
 
 def is_allowed_host(url):
@@ -134,17 +127,18 @@ def extract_arcface_embedding(img_rgb):
 
 
 def extract_adaface_embedding(img_rgb):
-    """Extract AdaFace IR-101 embedding from an RGB PIL image."""
-    model = get_adaface()
-    # AdaFace expects 112x112 BGR, normalized to [-1, 1]
-    img_resized = img_rgb.resize((112, 112), Image.BILINEAR)
-    img_bgr = np.array(img_resized)[:, :, ::-1]
-    img_norm = (img_bgr - 127.5) / 127.5
-    img_input = np.transpose(img_norm, (2, 0, 1))[np.newaxis, ...]  # (1, 3, 112, 112)
-    feat = model.get_feat(img_input.astype(np.float32))
-    # L2-normalize
-    feat = feat / (np.linalg.norm(feat) + 1e-8)
-    return feat.flatten()
+    """Extract embedding using buffalo_s w600k_mbf (MobileFaceNet).
+    Independent from ArcFace's w600k_r50 (ResNet50) — different architecture,
+    different embeddings, independent ensemble vote.
+    Falls back to buffalo_l (degraded) if buffalo_s unavailable."""
+    app = get_adaface()
+    img_bgr = np.array(img_rgb)[:, :, ::-1]
+    faces = app.get(img_bgr)
+    if len(faces) == 0:
+        return None
+    # Use the largest face (most prominent subject)
+    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    return face.normed_embedding  # 512-dim, L2-normalized
 
 
 def verify_embeddings(candidate_url, reference_urls, extract_fn, threshold):
@@ -154,7 +148,10 @@ def verify_embeddings(candidate_url, reference_urls, extract_fn, threshold):
     except Exception as e:
         return {'error': f'candidate download failed: {e}', 'face_detected': False}
 
-    candidate_emb = extract_fn(candidate_img)
+    try:
+        candidate_emb = extract_fn(candidate_img)
+    except Exception as e:
+        return {'error': f'candidate embedding failed: {e}', 'face_detected': False}
     if candidate_emb is None:
         return {'face_detected': False, 'error': 'no face detected in candidate'}
 
@@ -190,32 +187,71 @@ def verify_arcface():
     """ArcFace (InsightFace buffalo_l) cosine similarity. Threshold: 0.74."""
     if SHARED_SECRET and request.headers.get('X-Admin-Secret') != SHARED_SECRET:
         return jsonify({'error': 'Unauthorized'}), 401
-    data = request.get_json() or {}
-    candidate_url = (data.get('candidate_url') or '').strip()
-    reference_urls = data.get('reference_urls') or []
-    if not candidate_url or not reference_urls:
-        return jsonify({'error': 'candidate_url and reference_urls required'}), 400
-    result = verify_embeddings(candidate_url, reference_urls, extract_arcface_embedding, 0.74)
-    return jsonify(result)
+    try:
+        data = request.get_json() or {}
+        candidate_url = (data.get('candidate_url') or '').strip()
+        reference_urls = data.get('reference_urls') or []
+        if not candidate_url or not reference_urls:
+            return jsonify({'error': 'candidate_url and reference_urls required'}), 400
+        result = verify_embeddings(candidate_url, reference_urls, extract_arcface_embedding, 0.74)
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        return jsonify({'error': f'arcface_internal_error: {str(e)}', 'traceback': traceback.format_exc()[-500:]}), 500
 
 
 @app.route('/verify-adaface', methods=['POST'])
 def verify_adaface():
-    """AdaFace IR-101 cosine similarity. Threshold: 0.78."""
+    """AdaFace (buffalo_s w600k_mbf / MobileFaceNet) cosine similarity. Threshold: 0.78.
+    Falls back to buffalo_l (degraded) if buffalo_s unavailable."""
+    print('[AdaFace] /verify-adaface endpoint called', flush=True)
     if SHARED_SECRET and request.headers.get('X-Admin-Secret') != SHARED_SECRET:
+        print('[AdaFace] Unauthorized — secret mismatch', flush=True)
         return jsonify({'error': 'Unauthorized'}), 401
-    data = request.get_json() or {}
-    candidate_url = (data.get('candidate_url') or '').strip()
-    reference_urls = data.get('reference_urls') or []
-    if not candidate_url or not reference_urls:
-        return jsonify({'error': 'candidate_url and reference_urls required'}), 400
-    result = verify_embeddings(candidate_url, reference_urls, extract_adaface_embedding, 0.78)
-    return jsonify(result)
+    try:
+        data = request.get_json() or {}
+        candidate_url = (data.get('candidate_url') or '').strip()
+        reference_urls = data.get('reference_urls') or []
+        if not candidate_url or not reference_urls:
+            print('[AdaFace] Missing candidate_url or reference_urls', flush=True)
+            return jsonify({'error': 'candidate_url and reference_urls required'}), 400
+        print(f'[AdaFace] Processing: candidate={candidate_url[:60]}... refs={len(reference_urls)}', flush=True)
+        result = verify_embeddings(candidate_url, reference_urls, extract_adaface_embedding, 0.78)
+        if _adaface_degraded:
+            result['degraded'] = True
+            result['degraded_reason'] = 'buffalo_s unavailable, using buffalo_l (NOT independent)'
+            print('[AdaFace] Returning result in DEGRADED mode (buffalo_l fallback)', flush=True)
+        print(f'[AdaFace] Done: best_cosine={result.get("best_cosine")} verdict={result.get("verdict")}', flush=True)
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f'[AdaFace] EXCEPTION: {e}', flush=True)
+        print(f'[AdaFace] TRACEBACK: {tb[-800:]}', flush=True)
+        return jsonify({'error': f'adaface_internal_error: {str(e)}', 'traceback': tb[-500:]}), 500
+
+
+@app.route('/test-adaface', methods=['GET'])
+def test_adaface():
+    """Diagnostic endpoint: tests AdaFace model loading. Returns model status."""
+    try:
+        print('[AdaFace] /test-adaface diagnostic called', flush=True)
+        app = get_adaface()
+        return jsonify({
+            'status': 'ok',
+            'degraded': _adaface_degraded,
+            'model': 'buffalo_l (fallback — NOT independent)' if _adaface_degraded else 'buffalo_s w600k_mbf (independent)',
+        })
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f'[AdaFace] /test-adaface EXCEPTION: {e}', flush=True)
+        return jsonify({'status': 'error', 'error': str(e), 'traceback': tb[-500:]}), 500
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'models': ['arcface', 'adaface']})
+    return jsonify({'status': 'ok', 'models': ['arcface', 'adaface'], 'adaface_degraded': _adaface_degraded})
 
 
 if __name__ == '__main__':

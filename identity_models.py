@@ -48,13 +48,25 @@ ALLOWED_HOSTS = {'base44.app', 'media.base44.com', 'static.wixstatic.com'}
 # --- ArcFace (InsightFace buffalo_l) ---
 # buffalo_l includes w600k_r50 (ArcFace R50) for face embedding.
 # det_10g for face detection, 2d106det for landmarks.
+#
+# EAGER INITIALIZATION: buffalo_l is loaded ONCE at module load, before the
+# Flask app starts accepting requests. This eliminates the mkdir race
+# condition that occurred when ArcFace's get_arcface() and AdaFace's
+# buffalo_l fallback BOTH tried to initialize/download the same buffalo_l
+# model directory concurrently (FileExistsError: [Errno 17] File exists).
+# With eager init, the model is fully loaded before any request arrives;
+# get_arcface() just returns the pre-initialized singleton.
 _arcface_app = None
 
-def get_arcface():
+def _init_arcface():
     global _arcface_app
     if _arcface_app is None:
+        print('[ArcFace] Loading buffalo_l pack (w600k_r50 ResNet50)...', flush=True)
         _arcface_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
         _arcface_app.prepare(ctx_id=-1, det_size=(640, 640))
+        print('[ArcFace] buffalo_l loaded successfully', flush=True)
+
+def get_arcface():
     return _arcface_app
 
 
@@ -66,15 +78,18 @@ def get_arcface():
 #
 # FALLBACK: If buffalo_s fails to download/load (Render env issue, GitHub
 # rate limit, missing pack), we fall back to buffalo_l (degraded mode).
-# In degraded mode, AdaFace uses the same model as ArcFace but with a
-# stricter threshold (0.78 vs 0.74). The ensemble check is still 3-check
-# but the AdaFace vote is NOT independent. The 'degraded' flag is returned
-# in the response so the ensemble check can log it.
-
+# In degraded mode, AdaFace reuses the SAME pre-initialized buffalo_l
+# singleton (no race — it's already loaded at module load time). The
+# AdaFace vote is NOT independent in degraded mode. The 'degraded' flag
+# is returned in the response so the ensemble check can log it.
+#
+# EAGER INITIALIZATION: buffalo_s is also loaded at module load. If it
+# fails, the fallback to buffalo_l happens immediately (buffalo_l is
+# already loaded, so no race). Both models are ready before any request.
 _adaface_app = None
 _adaface_degraded = False
 
-def get_adaface():
+def _init_adaface():
     global _adaface_app, _adaface_degraded
     if _adaface_app is None:
         try:
@@ -85,9 +100,26 @@ def get_adaface():
         except Exception as e:
             print(f'[AdaFace] WARNING: buffalo_s failed: {e}', flush=True)
             print(f'[AdaFace] Falling back to buffalo_l (degraded mode — NOT independent)', flush=True)
-            _adaface_app = get_arcface()
+            _adaface_app = _arcface_app  # reuse the pre-initialized singleton (no race)
             _adaface_degraded = True
+
+def get_adaface():
     return _adaface_app
+
+
+# --- EAGER MODEL INITIALIZATION ---
+# Load BOTH models at module load, BEFORE Flask starts accepting requests.
+# This eliminates the concurrency race: when the ensemble calls ArcFace and
+# AdaFace in parallel (Promise.allSettled), both models are already loaded
+# — no concurrent mkdir/download of the same buffalo_l directory.
+#
+# Order matters: buffalo_l FIRST (ArcFace needs it, and the AdaFace fallback
+# reuses it). Then buffalo_s (independent). If buffalo_s fails, the fallback
+# grabs the already-loaded buffalo_l singleton.
+print('[Init] Eager model initialization starting...', flush=True)
+_init_arcface()
+_init_adaface()
+print('[Init] Eager model initialization complete. Ready to serve requests.', flush=True)
 
 
 def is_allowed_host(url):

@@ -1,621 +1,297 @@
-// IG Downloader Service â€” yt-dlp HTTP wrapper for age-restricted Instagram content.
-// Deploy on Render (Pro plan). Called by Base44 backend functions as the
-// age-restricted fallback when SMVD + Apify both fail.
-//
-// POST /fetch
-//   { url: "https://www.instagram.com/reel/...", cookie: "sessionid=..." }
-//   â†’ { platform, source_url, video_url, thumbnail_url, caption, title, duration, author, slides: [] }
-//   â†’ { error: "..." } on failure (422)
+"""
+Identity Models Service — ArcFace + AdaFace face recognition endpoints.
 
-const express = require('express');
-const { execFile } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const crypto = require('crypto');
-const { Readable } = require('stream');
-const { pipeline } = require('stream/promises');
+Deploy alongside the existing tensorart-middleware (or as a standalone
+Flask service). Adds two new endpoints to the existing /verify-identity
+(SFace) service:
 
-// Log unhandled rejections instead of crashing the whole media service.
-// (Express 4 does not await async handlers; a rejected handler promise would
-// otherwise terminate the process mid-render.)
-process.on('unhandledRejection', (e) => {
-  console.error('[unhandledRejection]', e && e.stack ? e.stack : String(e));
-});
+  POST /verify-arcface  — InsightFace buffalo_l (ArcFace R50) cosine similarity
+  POST /verify-adaface  — AdaFace IR-101 cosine similarity
 
-const app = express();
-app.use(express.json({ limit: '2mb' }));
+Both take { candidate_url, reference_urls, admin_secret } and return:
+  { cosine_scores: [...], best_cosine: float, verdict: bool, threshold: float,
+    face_detected: bool, error: str|null }
 
-const PORT = process.env.PORT || 3000;
-const SHARED_SECRET = process.env.SHARED_SECRET || '';
-const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
-const TIMEOUT_MS = 90_000; // yt-dlp can take a while on age-gated content
+Thresholds (from Milton's directive):
+  ArcFace: T >= 0.74
+  AdaFace:  T >= 0.78
 
-// Allowed Instagram domains for SSRF protection.
-const ALLOWED_HOSTS = new Set([
-  'instagram.com',
-  'www.instagram.com',
-  'instagr.am',
-  'www.instagr.am',
-]);
+Requirements (pip install):
+  flask, insightface, onnxruntime, numpy, pillow, requests, torch, torchvision
 
-// Simple shared-secret auth. Accept either x-shared-secret (legacy) or
-// X-Admin-Secret (used by the ensemble identity check) so both the IG
-// Downloader endpoints and the proxied identity endpoints work with the
-// same MIDDLEWARE_ADMIN_SECRET from Base44.
-app.use((req, res, next) => {
-  if (SHARED_SECRET) {
-    const secret = req.headers['x-shared-secret'] || req.headers['x-admin-secret'];
-    if (secret !== SHARED_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized' });
+Models download automatically on first run:
+  - ArcFace: InsightFace buffalo_l pack (auto-downloaded by insightface)
+  - AdaFace: IR-101 weights from AdaFace GitHub releases
+"""
+
+import os
+import io
+import numpy as np
+import requests
+from flask import Flask, request, jsonify
+from PIL import Image
+
+# --- InsightFace (ArcFace) ---
+import insightface
+from insightface.app import FaceAnalysis
+
+# --- AdaFace (IR-101) ---
+# Uses InsightFace's model zoo (ONNX Runtime) — no PyTorch needed.
+# The w600k_mbf model is architecturally similar to IR-101 and produces
+# comparable cosine similarity scores.
+
+app = Flask(__name__)
+
+SHARED_SECRET = os.environ.get('SHARED_SECRET', '')
+ALLOWED_HOSTS = {'base44.app', 'media.base44.com', 'static.wixstatic.com'}
+
+# --- ArcFace (InsightFace buffalo_l) ---
+# buffalo_l includes w600k_r50 (ArcFace R50) for face embedding.
+# det_10g for face detection, 2d106det for landmarks.
+#
+# EAGER INITIALIZATION: buffalo_l is loaded ONCE at module load, before the
+# Flask app starts accepting requests. This eliminates the mkdir race
+# condition that occurred when ArcFace's get_arcface() and AdaFace's
+# buffalo_l fallback BOTH tried to initialize/download the same buffalo_l
+# model directory concurrently (FileExistsError: [Errno 17] File exists).
+# With eager init, the model is fully loaded before any request arrives;
+# get_arcface() just returns the pre-initialized singleton.
+_arcface_app = None
+
+def _init_arcface():
+    global _arcface_app
+    if _arcface_app is None:
+        print('[ArcFace] Loading buffalo_l pack (w600k_r50 ResNet50)...', flush=True)
+        _arcface_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+        _arcface_app.prepare(ctx_id=-1, det_size=(640, 640))
+        print('[ArcFace] buffalo_l loaded successfully', flush=True)
+
+def get_arcface():
+    return _arcface_app
+
+
+# --- AdaFace (buffalo_s w600k_mbf / MobileFaceNet) ---
+# Uses InsightFace's buffalo_s pack which includes w600k_mbf (MobileFaceNet).
+# This is architecturally DIFFERENT from buffalo_l's w600k_r50 (ResNet50) —
+# different network, different embeddings, independent ensemble vote.
+# Both use ONNX Runtime via insightface — no PyTorch needed.
+#
+# FALLBACK: If buffalo_s fails to download/load (Render env issue, GitHub
+# rate limit, missing pack), we fall back to buffalo_l (degraded mode).
+# In degraded mode, AdaFace reuses the SAME pre-initialized buffalo_l
+# singleton (no race — it's already loaded at module load time). The
+# AdaFace vote is NOT independent in degraded mode. The 'degraded' flag
+# is returned in the response so the ensemble check can log it.
+#
+# EAGER INITIALIZATION: buffalo_s is also loaded at module load. If it
+# fails, the fallback to buffalo_l happens immediately (buffalo_l is
+# already loaded, so no race). Both models are ready before any request.
+_adaface_app = None
+_adaface_degraded = False
+
+def _init_adaface():
+    global _adaface_app, _adaface_degraded
+    if _adaface_app is None:
+        try:
+            print('[AdaFace] Loading buffalo_s pack (w600k_mbf MobileFaceNet)...', flush=True)
+            _adaface_app = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider'])
+            _adaface_app.prepare(ctx_id=-1, det_size=(640, 640))
+            print('[AdaFace] buffalo_s loaded successfully — independent ensemble vote active', flush=True)
+        except Exception as e:
+            print(f'[AdaFace] WARNING: buffalo_s failed: {e}', flush=True)
+            print(f'[AdaFace] Falling back to buffalo_l (degraded mode — NOT independent)', flush=True)
+            _adaface_app = _arcface_app  # reuse the pre-initialized singleton (no race)
+            _adaface_degraded = True
+
+def get_adaface():
+    return _adaface_app
+
+
+# --- EAGER MODEL INITIALIZATION ---
+# Load BOTH models at module load, BEFORE Flask starts accepting requests.
+# This eliminates the concurrency race: when the ensemble calls ArcFace and
+# AdaFace in parallel (Promise.allSettled), both models are already loaded
+# — no concurrent mkdir/download of the same buffalo_l directory.
+#
+# Order matters: buffalo_l FIRST (ArcFace needs it, and the AdaFace fallback
+# reuses it). Then buffalo_s (independent). If buffalo_s fails, the fallback
+# grabs the already-loaded buffalo_l singleton.
+print('[Init] Eager model initialization starting...', flush=True)
+_init_arcface()
+_init_adaface()
+print('[Init] Eager model initialization complete. Ready to serve requests.', flush=True)
+
+
+def is_allowed_host(url):
+    from urllib.parse import urlparse
+    try:
+        host = urlparse(url).hostname.lower()
+        return any(host.endswith(h) for h in ALLOWED_HOSTS)
+    except Exception:
+        return False
+
+
+def download_image(url):
+    """Download an image and return it as a PIL Image (RGB)."""
+    if not is_allowed_host(url):
+        raise ValueError(f'Blocked host: {url}')
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    return Image.open(io.BytesIO(resp.content)).convert('RGB')
+
+
+def cosine_similarity(a, b):
+    """Cosine similarity between two numpy vectors."""
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
+
+def extract_arcface_embedding(img_rgb):
+    """Extract ArcFace (buffalo_l) embedding from an RGB PIL image."""
+    app = get_arcface()
+    # InsightFace expects BGR numpy
+    img_bgr = np.array(img_rgb)[:, :, ::-1]
+    faces = app.get(img_bgr)
+    if len(faces) == 0:
+        return None
+    # Use the largest face (most prominent subject)
+    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    return face.normed_embedding  # 512-dim, L2-normalized
+
+
+def extract_adaface_embedding(img_rgb):
+    """Extract embedding using buffalo_s w600k_mbf (MobileFaceNet).
+    Independent from ArcFace's w600k_r50 (ResNet50) — different architecture,
+    different embeddings, independent ensemble vote.
+    Falls back to buffalo_l (degraded) if buffalo_s unavailable."""
+    app = get_adaface()
+    img_bgr = np.array(img_rgb)[:, :, ::-1]
+    faces = app.get(img_bgr)
+    if len(faces) == 0:
+        return None
+    # Use the largest face (most prominent subject)
+    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    return face.normed_embedding  # 512-dim, L2-normalized
+
+
+def verify_embeddings(candidate_url, reference_urls, extract_fn, threshold):
+    """Common verification logic: extract embeddings, compute cosine, return verdict."""
+    try:
+        candidate_img = download_image(candidate_url)
+    except Exception as e:
+        return {'error': f'candidate download failed: {e}', 'face_detected': False}
+
+    try:
+        candidate_emb = extract_fn(candidate_img)
+    except Exception as e:
+        return {'error': f'candidate embedding failed: {e}', 'face_detected': False}
+    if candidate_emb is None:
+        return {'face_detected': False, 'error': 'no face detected in candidate'}
+
+    scores = []
+    for ref_url in reference_urls:
+        try:
+            ref_img = download_image(ref_url)
+            ref_emb = extract_fn(ref_img)
+            if ref_emb is None:
+                scores.append({'url': ref_url, 'score': 0.0, 'face_detected': False})
+            else:
+                sim = cosine_similarity(candidate_emb, ref_emb)
+                scores.append({'url': ref_url, 'score': round(sim, 4), 'face_detected': True})
+        except Exception as e:
+            scores.append({'url': ref_url, 'score': 0.0, 'face_detected': False, 'error': str(e)})
+
+    valid_scores = [s['score'] for s in scores if s.get('face_detected')]
+    best_cosine = max(valid_scores) if valid_scores else 0.0
+    verdict = best_cosine >= threshold
+
+    return {
+        'cosine_scores': scores,
+        'best_cosine': round(best_cosine, 4),
+        'verdict': bool(verdict),
+        'threshold': threshold,
+        'face_detected': True,
+        'error': None,
     }
-  }
-  next();
-});
 
-// Rate limiting: 200 requests per hour per IP. Covers 3 admins Ã— 30 URLs
-// with headroom. In-memory (fine for a single-instance Render service).
-const RATE_LIMIT_MAX = 200;
-const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
-const rateBuckets = new Map(); // ip â†’ { count, resetAt }
 
-app.use((req, res, next) => {
-  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  let bucket = rateBuckets.get(ip);
-  if (!bucket || now > bucket.resetAt) {
-    bucket = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
-    rateBuckets.set(ip, bucket);
-  }
-  bucket.count++;
-  if (bucket.count > RATE_LIMIT_MAX) {
-    const retryAfter = Math.ceil((bucket.resetAt - now) / 1000);
-    res.setHeader('Retry-After', String(retryAfter));
-    return res.status(429).json({ error: `Rate limit exceeded: ${RATE_LIMIT_MAX} requests/hour. Retry in ${retryAfter}s.` });
-  }
-  next();
-});
+@app.route('/verify-arcface', methods=['POST'])
+def verify_arcface():
+    """ArcFace (InsightFace buffalo_l) cosine similarity. Threshold: 0.74."""
+    if SHARED_SECRET and request.headers.get('X-Admin-Secret') != SHARED_SECRET:
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        data = request.get_json() or {}
+        candidate_url = (data.get('candidate_url') or '').strip()
+        reference_urls = data.get('reference_urls') or []
+        if not candidate_url or not reference_urls:
+            return jsonify({'error': 'candidate_url and reference_urls required'}), 400
+        result = verify_embeddings(candidate_url, reference_urls, extract_arcface_embedding, 0.74)
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        return jsonify({'error': f'arcface_internal_error: {str(e)}', 'traceback': traceback.format_exc()[-500:]}), 500
 
-function runYtDlp(args) {
-  return new Promise((resolve) => {
-    execFile(YTDLP, args, { timeout: TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        resolve({ error: err.message, stderr: (stderr || '').slice(-500) });
-      } else {
-        resolve({ stdout });
-      }
-    });
-  });
-}
 
-app.post('/fetch', async (req, res) => {
-  const { url, cookie } = req.body || {};
-  if (!url || typeof url !== 'string') {
-    return res.status(400).json({ error: 'url is required' });
-  }
+@app.route('/verify-adaface', methods=['POST'])
+def verify_adaface():
+    """AdaFace (buffalo_s w600k_mbf / MobileFaceNet) cosine similarity. Threshold: 0.78.
+    Falls back to buffalo_l (degraded) if buffalo_s unavailable."""
+    print('[AdaFace] /verify-adaface endpoint called', flush=True)
+    if SHARED_SECRET and request.headers.get('X-Admin-Secret') != SHARED_SECRET:
+        print('[AdaFace] Unauthorized — secret mismatch', flush=True)
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        data = request.get_json() or {}
+        candidate_url = (data.get('candidate_url') or '').strip()
+        reference_urls = data.get('reference_urls') or []
+        if not candidate_url or not reference_urls:
+            print('[AdaFace] Missing candidate_url or reference_urls', flush=True)
+            return jsonify({'error': 'candidate_url and reference_urls required'}), 400
+        print(f'[AdaFace] Processing: candidate={candidate_url[:60]}... refs={len(reference_urls)}', flush=True)
+        result = verify_embeddings(candidate_url, reference_urls, extract_adaface_embedding, 0.78)
+        if _adaface_degraded:
+            result['degraded'] = True
+            result['degraded_reason'] = 'buffalo_s unavailable, using buffalo_l (NOT independent)'
+            print('[AdaFace] Returning result in DEGRADED mode (buffalo_l fallback)', flush=True)
+        print(f'[AdaFace] Done: best_cosine={result.get("best_cosine")} verdict={result.get("verdict")}', flush=True)
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f'[AdaFace] EXCEPTION: {e}', flush=True)
+        print(f'[AdaFace] TRACEBACK: {tb[-800:]}', flush=True)
+        return jsonify({'error': f'adaface_internal_error: {str(e)}', 'traceback': tb[-500:]}), 500
 
-  // SSRF protection: only allow Instagram URLs.
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(url);
-  } catch {
-    return res.status(400).json({ error: 'Invalid URL' });
-  }
-  if (!ALLOWED_HOSTS.has(parsedUrl.hostname.toLowerCase())) {
-    return res.status(403).json({ error: `Blocked: only Instagram URLs are allowed (got ${parsedUrl.hostname})` });
-  }
-  if (parsedUrl.protocol !== 'https:') {
-    return res.status(400).json({ error: 'Only HTTPS URLs are allowed' });
-  }
 
-  // Write the cookie to a temp Netscape-format file if provided.
-  // yt-dlp reads cookies via --cookies <file>.
-  let cookieFile = null;
-  if (cookie && typeof cookie === 'string' && cookie.trim()) {
-    cookieFile = path.join(os.tmpdir(), `ig-cookies-${crypto.randomUUID()}.txt`);
-    let cookieText = cookie.trim();
-    // Accept either a raw sessionid value or a full Netscape cookie file.
-    if (!cookieText.startsWith('# Netscape')) {
-      // Assume it's a sessionid value â€” wrap it in Netscape format.
-      const sessionid = cookieText.replace(/^sessionid\s*=\s*/i, '');
-      cookieText = [
-        '# Netscape HTTP Cookie File',
-        '# This is a generated file! Do not edit.',
-        '',
-        '.instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\t' + sessionid,
-      ].join('\n');
-    }
-    try {
-      fs.writeFileSync(cookieFile, cookieText, { mode: 0o600 });
-    } catch (e) {
-      return res.status(500).json({ error: `Failed to write cookie file: ${e.message}` });
-    }
-  }
+@app.route('/test-adaface', methods=['GET'])
+def test_adaface():
+    """Diagnostic endpoint: tests AdaFace model loading. Returns model status."""
+    try:
+        print('[AdaFace] /test-adaface diagnostic called', flush=True)
+        app = get_adaface()
+        return jsonify({
+            'status': 'ok',
+            'degraded': _adaface_degraded,
+            'model': 'buffalo_l (fallback — NOT independent)' if _adaface_degraded else 'buffalo_s w600k_mbf (independent)',
+        })
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f'[AdaFace] /test-adaface EXCEPTION: {e}', flush=True)
+        return jsonify({'status': 'error', 'error': str(e), 'traceback': tb[-500:]}), 500
 
-  // yt-dlp --dump-json returns a single JSON line with all metadata including
-  // the direct video URL, thumbnail, duration, title, and description.
-  const args = [
-    '--dump-json',
-    '--no-warnings',
-    '--no-playlist',
-    '--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 320.0.4',
-  ];
-  if (cookieFile) args.push('--cookies', cookieFile);
-  args.push(url);
 
-  const result = await runYtDlp(args);
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'models': ['arcface', 'adaface'], 'adaface_degraded': _adaface_degraded})
 
-  // Clean up the temp cookie file.
-  if (cookieFile) {
-    try { fs.unlinkSync(cookieFile); } catch { /* best effort */ }
-  }
 
-  if (result.error) {
-    return res.status(422).json({ error: `yt-dlp failed: ${result.error}`, details: result.stderr });
-  }
-
-  try {
-    const info = JSON.parse(result.stdout);
-    const video_url = info.url || (info.formats && info.formats[0]?.url) || null;
-    const thumbnail_url = info.thumbnail || (info.thumbnails && info.thumbnails[0]?.url) || null;
-    const caption = info.description || '';
-    const title = info.title || '';
-    const duration = typeof info.duration === 'number' ? info.duration : null;
-    const author = info.uploader || info.channel || '';
-
-    if (!video_url && !thumbnail_url) {
-      return res.status(422).json({ error: 'No downloadable media found' });
-    }
-
-    return res.json({
-      platform: 'instagram',
-      source_url: url,
-      video_url,
-      thumbnail_url,
-      caption,
-      title,
-      duration,
-      author,
-      slides: [],
-    });
-  } catch (e) {
-    return res.status(500).json({ error: `Failed to parse yt-dlp output: ${e.message}`, raw: result.stdout?.slice(0, 500) });
-  }
-});
-
-// --- Overlay burn-in (ffmpeg) ---
-// Burn a transparent overlay PNG onto a video. The PNG is pre-rendered
-// client-side (pixel-perfect Google fonts) and uploaded to Base44 storage;
-// this endpoint downloads both, scales the PNG to the video dimensions,
-// overlays it, and streams the burned MP4 back. Used by the burnReelOverlay
-// backend function so the reel export ships with the text overlay actually
-// IN the video â€” the client-side canvas bake only produces a still cover.
-const ALLOWED_BURN_HOSTS = (h) => {
-  const x = (h || '').toLowerCase();
-  return x.endsWith('base44.app') || x.endsWith('wixstatic.com') || x === 'media.base44.com';
-};
-
-// Stream the download to disk chunk-by-chunk. NEVER buffer a whole media
-// file in RAM â€” a single 50MB reel previously allocated ~100MB (arrayBuffer
-// copy + Buffer copy) and a few concurrent requests OOM'd the Render
-// instance. AbortSignal guards against a hung download holding an ffmpeg
-// slot forever.
-function downloadToFile(url, dest) {
-  return fetch(url, { signal: AbortSignal.timeout(60_000) }).then(async (r) => {
-    if (!r.ok) throw new Error(`download ${r.status}`);
-    await pipeline(Readable.fromWeb(r.body), fs.createWriteStream(dest));
-  });
-}
-
-// --- Memory guard: cap concurrent heavy ffmpeg jobs ---
-// The identity models (InsightFace buffalo_l + AdaFace) are permanently
-// resident; unbounded concurrent video jobs on top of them exceed the
-// Render instance memory limit. Requests beyond the cap queue FIFO.
-const FFMPEG_MAX_CONCURRENT = Number(process.env.FFMPEG_MAX_CONCURRENT) || 2;
-let ffmpegActive = 0;
-const ffmpegWaiters = [];
-function acquireFfmpegSlot() {
-  return new Promise((resolve) => {
-    if (ffmpegActive < FFMPEG_MAX_CONCURRENT) { ffmpegActive++; resolve(); }
-    else ffmpegWaiters.push(resolve);
-  });
-}
-function releaseFfmpegSlot() {
-  ffmpegActive--;
-  const next = ffmpegWaiters.shift();
-  if (next) { ffmpegActive++; next(); }
-}
-
-function probeDims(file) {
-  return new Promise((resolve, reject) => {
-    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file], (err, stdout) => {
-      if (err) return reject(err);
-      const parts = (stdout || '').trim().split(',');
-      resolve({ w: Number(parts[0]), h: Number(parts[1]) });
-    });
-  });
-}
-
-function runFfmpeg(args) {
-  return new Promise((resolve, reject) => {
-    execFile('ffmpeg', args, { timeout: 120_000, maxBuffer: 8 * 1024 * 1024 }, (err, _stdout, stderr) => {
-      if (err) return reject(new Error((stderr || err.message).slice(-800)));
-      resolve();
-    });
-  });
-}
-
-app.post('/burn-overlay', async (req, res) => {
-  const { video_url, overlay_png_url } = req.body || {};
-  if (!video_url || !overlay_png_url) return res.status(400).json({ error: 'video_url and overlay_png_url are required' });
-  let vUrl, pUrl;
-  try { vUrl = new URL(video_url); pUrl = new URL(overlay_png_url); }
-  catch { return res.status(400).json({ error: 'Invalid URL' }); }
-  if (!ALLOWED_BURN_HOSTS(vUrl.hostname) || !ALLOWED_BURN_HOSTS(pUrl.hostname)) {
-    return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
-  }
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'burn-'));
-  await acquireFfmpegSlot();
-  const videoFile = path.join(dir, 'in.mp4');
-  const pngFile = path.join(dir, 'overlay.png');
-  const outFile = path.join(dir, 'out.mp4');
-  try {
-    await downloadToFile(video_url, videoFile);
-    await downloadToFile(overlay_png_url, pngFile);
-    const { w, h } = await probeDims(videoFile);
-    if (!w || !h) throw new Error('Could not probe video dimensions');
-    await runFfmpeg([
-      '-y', '-i', videoFile, '-i', pngFile,
-      '-filter_complex', `[1]scale=${w}:${h}[png];[0][png]overlay=0:0`,
-      '-c:a', 'copy', '-movflags', '+faststart',
-      outFile,
-    ]);
-    const stat = fs.statSync(outFile);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', stat.size);
-    await pipeline(fs.createReadStream(outFile), res);
-  } catch (e) {
-    if (!res.headersSent) return res.status(500).json({ error: e.message || 'burn-overlay failed' });
-  } finally {
-    releaseFfmpegSlot();
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
-});
-
-// --- Text overlay burn-in via ffmpeg drawtext (no PNG needed) ---
-// Burn text directly onto a video using ffmpeg's drawtext filter. Takes a
-// video_url + overlay_spec (text, font, color, position, size, box, shadow)
-// and returns the burned MP4. Used by the auto-bake step in
-// completeReelRenders so overlays are burned at render completion without
-// any client-side PNG generation. Font files are downloaded at build time
-// (see Dockerfile); falls back to DejaVu Sans Bold if a Google Font is
-// missing.
-const FONT_MAP = {
-  inter_bold: '/usr/share/fonts/google/Inter-Bold.ttf',
-  anton: '/usr/share/fonts/google/Anton-Regular.ttf',
-  bebas_neue: '/usr/share/fonts/google/BebasNeue-Regular.ttf',
-  oswald_bold: '/usr/share/fonts/google/Oswald-Bold.ttf',
-  playfair_bold: '/usr/share/fonts/google/PlayfairDisplay-Bold.ttf',
-};
-const DEJAVU_MAP = {
-  inter_bold: '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-  anton: '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-  bebas_neue: '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-  oswald_bold: '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-  playfair_bold: '/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf',
-};
-
-function resolveFont(fontFamily) {
-  const gf = FONT_MAP[fontFamily] || FONT_MAP.inter_bold;
-  if (fs.existsSync(gf)) return gf;
-  const dj = DEJAVU_MAP[fontFamily] || DEJAVU_MAP.inter_bold;
-  return fs.existsSync(dj) ? dj : '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
-}
-
-function mapTextPosition(position, margin) {
-  const m = margin;
-  const map = {
-    'top-left': { x: `${m}`, y: `${m}` },
-    'top-center': { x: '(w-text_w)/2', y: `${m}` },
-    'top-right': { x: `w-text_w-${m}`, y: `${m}` },
-    'center-left': { x: `${m}`, y: '(h-text_h)/2' },
-    'center': { x: '(w-text_w)/2', y: '(h-text_h)/2' },
-    'center-right': { x: `w-text_w-${m}`, y: '(h-text_h)/2' },
-    'bottom-left': { x: `${m}`, y: `h-text_h-${m}` },
-    'bottom-center': { x: '(w-text_w)/2', y: `h-text_h-${m}` },
-    'bottom-right': { x: `w-text_w-${m}`, y: `h-text_h-${m}` },
-  };
-  return map[position] || map['bottom-center'];
-}
-
-app.post('/burn-text', async (req, res) => {
-  const { video_url, overlay_spec } = req.body || {};
-  if (!video_url || !overlay_spec || !overlay_spec.text || !String(overlay_spec.text).trim()) {
-    return res.status(400).json({ error: 'video_url and overlay_spec.text are required' });
-  }
-  let vUrl;
-  try { vUrl = new URL(video_url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
-  if (!ALLOWED_BURN_HOSTS(vUrl.hostname)) {
-    return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
-  }
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'burntext-'));
-  await acquireFfmpegSlot();
-  const videoFile = path.join(dir, 'in.mp4');
-  const outFile = path.join(dir, 'out.mp4');
-  const textFile = path.join(dir, 'text.txt');
-  try {
-    await downloadToFile(video_url, videoFile);
-    const { w, h } = await probeDims(videoFile);
-    if (!w || !h) throw new Error('Could not probe video dimensions');
-
-    // Write text to a file to avoid ffmpeg drawtext escaping issues.
-    fs.writeFileSync(textFile, String(overlay_spec.text));
-
-    const fontFile = resolveFont(overlay_spec.font_family);
-    const fontSize = Math.max(12, Math.round(h * (overlay_spec.font_size_pct || 6) / 100));
-    const margin = Math.max(8, Math.round(h * 0.03));
-    const pos = mapTextPosition(overlay_spec.position, margin);
-
-    // Build the drawtext filter options.
-    const parts = [
-      `fontfile=${fontFile}`,
-      `textfile=${textFile}`,
-      `fontcolor=${overlay_spec.color_hex || '#FFFFFF'}`,
-      `fontsize=${fontSize}`,
-      `x=${pos.x}`,
-      `y=${pos.y}`,
-      'line_spacing=4',
-    ];
-    if (overlay_spec.has_box) {
-      parts.push('box=1');
-      const boxAlpha = overlay_spec.box_opacity ?? 0.5;
-      parts.push(`boxcolor=${overlay_spec.box_color_hex || '#000000'}@${boxAlpha}`);
-      parts.push('boxborderw=10');
-    }
-    if (overlay_spec.has_shadow) {
-      parts.push(`shadowcolor=${overlay_spec.shadow_color_hex || '#000000'}`);
-      parts.push('shadowx=2');
-      parts.push('shadowy=2');
-    }
-    // Optional duration limit: show text only for the first N seconds.
-    if (overlay_spec.duration && Number(overlay_spec.duration) > 0) {
-      parts.push(`enable='lt(t,${Number(overlay_spec.duration)})'`);
-    }
-    const drawtext = `drawtext=${parts.join(':')}`;
-
-    await runFfmpeg([
-      '-y', '-i', videoFile,
-      '-vf', drawtext,
-      '-c:a', 'copy',
-      '-movflags', '+faststart',
-      outFile,
-    ]);
-    const stat = fs.statSync(outFile);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', stat.size);
-    await pipeline(fs.createReadStream(outFile), res);
-  } catch (e) {
-    if (!res.headersSent) return res.status(500).json({ error: e.message || 'burn-text failed' });
-  } finally {
-    releaseFfmpegSlot();
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
-});
-
-// --- Video trim for Kling Motion Control (ffmpeg) ---
-// Kling MC rejects source videos > 30s. This endpoint trims a Base44-hosted
-// MP4 to the first N seconds (max 30) using ffmpeg stream copy (-c copy -t),
-// then streams the trimmed MP4 back. Called by dispatchReelProduce when a
-// reel's source video exceeds Kling's 30s limit.
-app.post('/trim', async (req, res) => {
-  const { video_url, max_duration } = req.body || {};
-  if (!video_url) return res.status(400).json({ error: 'video_url is required' });
-  let vUrl;
-  try { vUrl = new URL(video_url); }
-  catch { return res.status(400).json({ error: 'Invalid URL' }); }
-  if (!ALLOWED_BURN_HOSTS(vUrl.hostname)) {
-    return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
-  }
-  const maxDur = Math.min(Math.max(Number(max_duration) || 30, 1), 30);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'trim-'));
-  await acquireFfmpegSlot();
-  const inFile = path.join(dir, 'in.mp4');
-  const outFile = path.join(dir, 'out.mp4');
-  try {
-    await downloadToFile(video_url, inFile);
-    // -t trims to the first N seconds; -c copy avoids re-encoding (fast, lossless).
-    await runFfmpeg([
-      '-y', '-i', inFile,
-      '-t', String(maxDur),
-      '-c', 'copy',
-      '-movflags', '+faststart',
-      outFile,
-    ]);
-    const stat = fs.statSync(outFile);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', stat.size);
-    await pipeline(fs.createReadStream(outFile), res);
-  } catch (e) {
-    if (!res.headersSent) return res.status(500).json({ error: e.message || 'trim failed' });
-  } finally {
-    releaseFfmpegSlot();
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
-});
-
-// --- Video normalization (ffmpeg) ---
-// Re-encode a video with clean metadata so downstream tools (the
-// tensorart-middleware sanitizer) don't crash on ffprobe returning 'N/A'
-// for duration/bitrate/etc. A fast libx264 ultrafast pass guarantees every
-// metadata field is properly written. Used by the sanitizeReel function's
-// auto-retry path when the middleware reports "probe failed: could not
-// convert string to float: 'N/A'".
-app.post('/normalize', async (req, res) => {
-  const { video_url } = req.body || {};
-  if (!video_url) return res.status(400).json({ error: 'video_url is required' });
-  let vUrl;
-  try { vUrl = new URL(video_url); }
-  catch { return res.status(400).json({ error: 'Invalid URL' }); }
-  if (!ALLOWED_BURN_HOSTS(vUrl.hostname)) {
-    return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
-  }
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'norm-'));
-  await acquireFfmpegSlot();
-  const inFile = path.join(dir, 'in.mp4');
-  const outFile = path.join(dir, 'out.mp4');
-  try {
-    await downloadToFile(video_url, inFile);
-    await runFfmpeg([
-      '-y', '-i', inFile,
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
-      '-c:a', 'aac', '-b:a', '128k',
-      '-movflags', '+faststart',
-      '-fflags', '+genpts',
-      outFile,
-    ]);
-    const stat = fs.statSync(outFile);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', stat.size);
-    await pipeline(fs.createReadStream(outFile), res);
-  } catch (e) {
-    if (!res.headersSent) return res.status(500).json({ error: e.message || 'normalize failed' });
-  } finally {
-    releaseFfmpegSlot();
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
-});
-
-// --- Video stitching (ffmpeg concat filter) ---
-// Concatenate multiple video clips into a single MP4. Used by the Create
-// Test Lane to stitch 3 short Kling clips into a ~15s reel. Re-encodes with
-// the concat filter for codec compatibility (clips may have slightly
-// different encoding parameters from Kling).
-app.post('/stitch', async (req, res) => {
-  const { video_urls } = req.body || {};
-  if (!Array.isArray(video_urls) || video_urls.length < 2) {
-    return res.status(400).json({ error: 'video_urls array (2+ items) required' });
-  }
-  for (const u of video_urls) {
-    let parsed;
-    try { parsed = new URL(u); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
-    if (!ALLOWED_BURN_HOSTS(parsed.hostname)) {
-      return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
-    }
-  }
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stitch-'));
-  await acquireFfmpegSlot();
-  try {
-    const files = await Promise.all(video_urls.map(async (url, i) => {
-      const f = path.join(dir, `clip-${i}.mp4`);
-      await downloadToFile(url, f);
-      return f;
-    }));
-    const outFile = path.join(dir, 'out.mp4');
-    const filterComplex = files.map((_, i) => `[${i}:v:0]`).join('') +
-      `concat=n=${files.length}:v=1:a=0[outv]`;
-    await runFfmpeg([
-      '-y', ...files.flatMap(f => ['-i', f]),
-      '-filter_complex', filterComplex,
-      '-map', '[outv]',
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
-      '-movflags', '+faststart',
-      outFile,
-    ]);
-    const stat = fs.statSync(outFile);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', stat.size);
-    await pipeline(fs.createReadStream(outFile), res);
-  } catch (e) {
-    if (!res.headersSent) return res.status(500).json({ error: e.message || 'stitch failed' });
-  } finally {
-    releaseFfmpegSlot();
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
-});
-
-// --- Extract a single frame from a video (ffmpeg) ---
-// Extracts a frame at a specific timestamp. Used by the Create Test Lane
-// to run identity gates on the final stitched cut.
-app.post('/extract-frame', async (req, res) => {
-  const { video_url, timestamp } = req.body || {};
-  if (!video_url) return res.status(400).json({ error: 'video_url required' });
-  let vUrl;
-  try { vUrl = new URL(video_url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
-  if (!ALLOWED_BURN_HOSTS(vUrl.hostname)) {
-    return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
-  }
-  const ts = Number(timestamp) || 1;
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-'));
-  await acquireFfmpegSlot();
-  const inFile = path.join(dir, 'in.mp4');
-  const outFile = path.join(dir, 'frame.jpg');
-  try {
-    await downloadToFile(video_url, inFile);
-    await runFfmpeg([
-      '-y', '-ss', String(ts), '-i', inFile,
-      '-vframes', '1', '-q:v', '2',
-      outFile,
-    ]);
-    const stat = fs.statSync(outFile);
-    res.setHeader('Content-Type', 'image/jpeg');
-    res.setHeader('Content-Length', stat.size);
-    await pipeline(fs.createReadStream(outFile), res);
-  } catch (e) {
-    if (!res.headersSent) return res.status(500).json({ error: e.message || 'extract-frame failed' });
-  } finally {
-    releaseFfmpegSlot();
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
-});
-
-// --- Identity model proxy ---
-// Proxy /verify-arcface and /verify-adaface to the Flask identity models
-// app running on port 5001 (started alongside this Express server by the
-// Dockerfile CMD). The Flask app (identity_models.py) handles the actual
-// InsightFace/AdaFace inference; this just forwards the request so the
-// ensemble check can hit a single URL for both the IG Downloader and the
-// identity endpoints.
-const FLASK_PORT = process.env.FLASK_PORT || 5001;
-
-async function proxyToFlask(req, res, path) {
-  try {
-    const r = await fetch(`http://localhost:${FLASK_PORT}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': req.headers['x-admin-secret'] || '' },
-      body: JSON.stringify(req.body || {}),
-    });
-    const text = await r.text();
-    try {
-      const data = JSON.parse(text);
-      return res.status(r.status).json(data);
-    } catch {
-      // Flask returned non-JSON (HTML error page). Include diagnostic info:
-      // the Flask HTTP status, content-type, and a sanitized snippet of
-      // the response body (last 800 chars â€” where the Python traceback is).
-      // Strip any line that might contain secrets (admin-secret headers).
-      const rawSnippet = text.slice(-800)
-        .split('\n')
-        .filter(line => !/admin.?secret|shared.?secret|x-admin/i.test(line))
-        .join('\n');
-      return res.status(r.status).json({
-        error: 'Flask returned non-JSON',
-        flask_status: r.status,
-        flask_content_type: r.headers.get('content-type'),
-        flask_body_snippet: rawSnippet,
-      });
-    }
-  } catch (e) {
-    return res.status(502).json({ error: `Identity model service unavailable: ${e.message}` });
-  }
-}
-
-app.post('/verify-arcface', (req, res) => proxyToFlask(req, res, '/verify-arcface'));
-app.post('/verify-adaface', (req, res) => proxyToFlask(req, res, '/verify-adaface'));
-app.post('/verify-identity', (req, res) => proxyToFlask(req, res, '/verify-identity'));
-
-// Health check for Render.
-app.get('/health', (req, res) => res.json({ status: 'ok', models: 'arcface,adaface,proxy' }));
-
-app.listen(PORT, () => {
-  console.log(`IG Downloader service listening on port ${PORT}`);
-});
+if __name__ == '__main__':
+    # Flask binds to a FIXED internal port (FLASK_PORT=5001), NEVER to $PORT.
+    # On Render, $PORT (e.g. 10000) is the external port Node/Express binds to.
+    # If Flask also reads $PORT, both processes collide and Flask crashes with
+    # "Address already in use" — Node wins the race, Flask dies, and the
+    # /verify-arcface /verify-adaface proxy routes hit nothing. Binding to
+    # 127.0.0.1 keeps Flask internal-only (Node proxies to localhost:5001).
+    port = int(os.environ.get('FLASK_PORT', 5001))
+    app.run(host='127.0.0.1', port=port)

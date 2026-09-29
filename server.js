@@ -1,11 +1,11 @@
-// IG Downloader Service — yt-dlp HTTP wrapper for age-restricted Instagram content.
+// IG Downloader Service â€” yt-dlp HTTP wrapper for age-restricted Instagram content.
 // Deploy on Render (Pro plan). Called by Base44 backend functions as the
 // age-restricted fallback when SMVD + Apify both fail.
 //
 // POST /fetch
 //   { url: "https://www.instagram.com/reel/...", cookie: "sessionid=..." }
-//   → { platform, source_url, video_url, thumbnail_url, caption, title, duration, author, slides: [] }
-//   → { error: "..." } on failure (422)
+//   â†’ { platform, source_url, video_url, thumbnail_url, caption, title, duration, author, slides: [] }
+//   â†’ { error: "..." } on failure (422)
 
 const express = require('express');
 const { execFile } = require('child_process');
@@ -13,6 +13,15 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
+
+// Log unhandled rejections instead of crashing the whole media service.
+// (Express 4 does not await async handlers; a rejected handler promise would
+// otherwise terminate the process mid-render.)
+process.on('unhandledRejection', (e) => {
+  console.error('[unhandledRejection]', e && e.stack ? e.stack : String(e));
+});
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -44,11 +53,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// Rate limiting: 200 requests per hour per IP. Covers 3 admins × 30 URLs
+// Rate limiting: 200 requests per hour per IP. Covers 3 admins Ã— 30 URLs
 // with headroom. In-memory (fine for a single-instance Render service).
 const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
-const rateBuckets = new Map(); // ip → { count, resetAt }
+const rateBuckets = new Map(); // ip â†’ { count, resetAt }
 
 app.use((req, res, next) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
@@ -107,7 +116,7 @@ app.post('/fetch', async (req, res) => {
     let cookieText = cookie.trim();
     // Accept either a raw sessionid value or a full Netscape cookie file.
     if (!cookieText.startsWith('# Netscape')) {
-      // Assume it's a sessionid value — wrap it in Netscape format.
+      // Assume it's a sessionid value â€” wrap it in Netscape format.
       const sessionid = cookieText.replace(/^sessionid\s*=\s*/i, '');
       cookieText = [
         '# Netscape HTTP Cookie File',
@@ -180,17 +189,41 @@ app.post('/fetch', async (req, res) => {
 // this endpoint downloads both, scales the PNG to the video dimensions,
 // overlays it, and streams the burned MP4 back. Used by the burnReelOverlay
 // backend function so the reel export ships with the text overlay actually
-// IN the video — the client-side canvas bake only produces a still cover.
+// IN the video â€” the client-side canvas bake only produces a still cover.
 const ALLOWED_BURN_HOSTS = (h) => {
   const x = (h || '').toLowerCase();
   return x.endsWith('base44.app') || x.endsWith('wixstatic.com') || x === 'media.base44.com';
 };
 
+// Stream the download to disk chunk-by-chunk. NEVER buffer a whole media
+// file in RAM â€” a single 50MB reel previously allocated ~100MB (arrayBuffer
+// copy + Buffer copy) and a few concurrent requests OOM'd the Render
+// instance. AbortSignal guards against a hung download holding an ffmpeg
+// slot forever.
 function downloadToFile(url, dest) {
-  return fetch(url).then((r) => {
+  return fetch(url, { signal: AbortSignal.timeout(60_000) }).then(async (r) => {
     if (!r.ok) throw new Error(`download ${r.status}`);
-    return r.arrayBuffer();
-  }).then((ab) => fs.writeFileSync(dest, Buffer.from(ab)));
+    await pipeline(Readable.fromWeb(r.body), fs.createWriteStream(dest));
+  });
+}
+
+// --- Memory guard: cap concurrent heavy ffmpeg jobs ---
+// The identity models (InsightFace buffalo_l + AdaFace) are permanently
+// resident; unbounded concurrent video jobs on top of them exceed the
+// Render instance memory limit. Requests beyond the cap queue FIFO.
+const FFMPEG_MAX_CONCURRENT = Number(process.env.FFMPEG_MAX_CONCURRENT) || 2;
+let ffmpegActive = 0;
+const ffmpegWaiters = [];
+function acquireFfmpegSlot() {
+  return new Promise((resolve) => {
+    if (ffmpegActive < FFMPEG_MAX_CONCURRENT) { ffmpegActive++; resolve(); }
+    else ffmpegWaiters.push(resolve);
+  });
+}
+function releaseFfmpegSlot() {
+  ffmpegActive--;
+  const next = ffmpegWaiters.shift();
+  if (next) { ffmpegActive++; next(); }
 }
 
 function probeDims(file) {
@@ -222,6 +255,7 @@ app.post('/burn-overlay', async (req, res) => {
     return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'burn-'));
+  await acquireFfmpegSlot();
   const videoFile = path.join(dir, 'in.mp4');
   const pngFile = path.join(dir, 'overlay.png');
   const outFile = path.join(dir, 'out.mp4');
@@ -236,12 +270,14 @@ app.post('/burn-overlay', async (req, res) => {
       '-c:a', 'copy', '-movflags', '+faststart',
       outFile,
     ]);
-    const buf = fs.readFileSync(outFile);
+    const stat = fs.statSync(outFile);
     res.setHeader('Content-Type', 'video/mp4');
-    return res.send(buf);
+    res.setHeader('Content-Length', stat.size);
+    await pipeline(fs.createReadStream(outFile), res);
   } catch (e) {
-    return res.status(500).json({ error: e.message || 'burn-overlay failed' });
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'burn-overlay failed' });
   } finally {
+    releaseFfmpegSlot();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 });
@@ -303,6 +339,7 @@ app.post('/burn-text', async (req, res) => {
     return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'burntext-'));
+  await acquireFfmpegSlot();
   const videoFile = path.join(dir, 'in.mp4');
   const outFile = path.join(dir, 'out.mp4');
   const textFile = path.join(dir, 'text.txt');
@@ -353,12 +390,14 @@ app.post('/burn-text', async (req, res) => {
       '-movflags', '+faststart',
       outFile,
     ]);
-    const buf = fs.readFileSync(outFile);
+    const stat = fs.statSync(outFile);
     res.setHeader('Content-Type', 'video/mp4');
-    return res.send(buf);
+    res.setHeader('Content-Length', stat.size);
+    await pipeline(fs.createReadStream(outFile), res);
   } catch (e) {
-    return res.status(500).json({ error: e.message || 'burn-text failed' });
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'burn-text failed' });
   } finally {
+    releaseFfmpegSlot();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 });
@@ -379,6 +418,7 @@ app.post('/trim', async (req, res) => {
   }
   const maxDur = Math.min(Math.max(Number(max_duration) || 30, 1), 30);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'trim-'));
+  await acquireFfmpegSlot();
   const inFile = path.join(dir, 'in.mp4');
   const outFile = path.join(dir, 'out.mp4');
   try {
@@ -391,12 +431,14 @@ app.post('/trim', async (req, res) => {
       '-movflags', '+faststart',
       outFile,
     ]);
-    const buf = fs.readFileSync(outFile);
+    const stat = fs.statSync(outFile);
     res.setHeader('Content-Type', 'video/mp4');
-    return res.send(buf);
+    res.setHeader('Content-Length', stat.size);
+    await pipeline(fs.createReadStream(outFile), res);
   } catch (e) {
-    return res.status(500).json({ error: e.message || 'trim failed' });
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'trim failed' });
   } finally {
+    releaseFfmpegSlot();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 });
@@ -418,6 +460,7 @@ app.post('/normalize', async (req, res) => {
     return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'norm-'));
+  await acquireFfmpegSlot();
   const inFile = path.join(dir, 'in.mp4');
   const outFile = path.join(dir, 'out.mp4');
   try {
@@ -430,12 +473,14 @@ app.post('/normalize', async (req, res) => {
       '-fflags', '+genpts',
       outFile,
     ]);
-    const buf = fs.readFileSync(outFile);
+    const stat = fs.statSync(outFile);
     res.setHeader('Content-Type', 'video/mp4');
-    return res.send(buf);
+    res.setHeader('Content-Length', stat.size);
+    await pipeline(fs.createReadStream(outFile), res);
   } catch (e) {
-    return res.status(500).json({ error: e.message || 'normalize failed' });
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'normalize failed' });
   } finally {
+    releaseFfmpegSlot();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 });
@@ -458,6 +503,7 @@ app.post('/stitch', async (req, res) => {
     }
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stitch-'));
+  await acquireFfmpegSlot();
   try {
     const files = await Promise.all(video_urls.map(async (url, i) => {
       const f = path.join(dir, `clip-${i}.mp4`);
@@ -475,12 +521,14 @@ app.post('/stitch', async (req, res) => {
       '-movflags', '+faststart',
       outFile,
     ]);
-    const buf = fs.readFileSync(outFile);
+    const stat = fs.statSync(outFile);
     res.setHeader('Content-Type', 'video/mp4');
-    return res.send(buf);
+    res.setHeader('Content-Length', stat.size);
+    await pipeline(fs.createReadStream(outFile), res);
   } catch (e) {
-    return res.status(500).json({ error: e.message || 'stitch failed' });
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'stitch failed' });
   } finally {
+    releaseFfmpegSlot();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 });
@@ -498,6 +546,7 @@ app.post('/extract-frame', async (req, res) => {
   }
   const ts = Number(timestamp) || 1;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-'));
+  await acquireFfmpegSlot();
   const inFile = path.join(dir, 'in.mp4');
   const outFile = path.join(dir, 'frame.jpg');
   try {
@@ -507,12 +556,14 @@ app.post('/extract-frame', async (req, res) => {
       '-vframes', '1', '-q:v', '2',
       outFile,
     ]);
-    const buf = fs.readFileSync(outFile);
+    const stat = fs.statSync(outFile);
     res.setHeader('Content-Type', 'image/jpeg');
-    return res.send(buf);
+    res.setHeader('Content-Length', stat.size);
+    await pipeline(fs.createReadStream(outFile), res);
   } catch (e) {
-    return res.status(500).json({ error: e.message || 'extract-frame failed' });
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'extract-frame failed' });
   } finally {
+    releaseFfmpegSlot();
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 });
@@ -540,7 +591,7 @@ async function proxyToFlask(req, res, path) {
     } catch {
       // Flask returned non-JSON (HTML error page). Include diagnostic info:
       // the Flask HTTP status, content-type, and a sanitized snippet of
-      // the response body (last 800 chars — where the Python traceback is).
+      // the response body (last 800 chars â€” where the Python traceback is).
       // Strip any line that might contain secrets (admin-secret headers).
       const rawSnippet = text.slice(-800)
         .split('\n')

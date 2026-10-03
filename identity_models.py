@@ -281,6 +281,63 @@ def test_adaface():
         return jsonify({'status': 'error', 'error': str(e), 'traceback': tb[-500:]}), 500
 
 
+@app.route('/detect-face', methods=['POST'])
+def detect_face():
+    """Face detection on an image URL. Returns face_detected, face_count, is_frontal.
+    Used by Scout v2's deterministic pre-filter (Spec §4). Accepts any image URL
+    (including CDN URLs) since Scout discovers content before it's mirrored.
+    Protected by the shared secret."""
+    if SHARED_SECRET and request.headers.get('X-Admin-Secret') != SHARED_SECRET:
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        data = request.get_json() or {}
+        image_url = (data.get('image_url') or '').strip()
+        if not image_url:
+            return jsonify({'error': 'image_url required'}), 400
+
+        # Download the image — allow any host for detection (Scout discovers
+        # CDN URLs that need checking before they're mirrored).
+        try:
+            resp = requests.get(image_url, timeout=30)
+            resp.raise_for_status()
+            img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+        except Exception as e:
+            return jsonify({'error': f'image download failed: {e}', 'face_detected': False}), 200
+
+        app_arc = get_arcface()
+        img_bgr = np.array(img)[:, :, ::-1]
+        faces = app_arc.get(img_bgr)
+
+        if len(faces) == 0:
+            return jsonify({'face_detected': False, 'face_count': 0, 'is_frontal': False})
+
+        # Find the largest face (most prominent subject)
+        largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        bbox = largest.bbox  # [x1, y1, x2, y2]
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+
+        # Frontal heuristic: bbox roughly square (aspect ratio 0.7-1.3) and
+        # detection score > 0.5. Profile shots have wider bboxes.
+        aspect = w / h if h > 0 else 0
+        is_frontal = 0.7 < aspect < 1.3 and float(largest.det_score) > 0.5
+
+        return jsonify({
+            'face_detected': True,
+            'face_count': len(faces),
+            'is_frontal': bool(is_frontal),
+            'largest_face': {
+                'bbox': [float(x) for x in bbox],
+                'width': float(w),
+                'height': float(h),
+                'score': float(largest.det_score),
+            },
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': f'detect_face_error: {str(e)}', 'traceback': traceback.format_exc()[-500:]}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok', 'models': ['arcface', 'adaface'], 'adaface_degraded': _adaface_degraded})

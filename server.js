@@ -1,11 +1,11 @@
-// IG Downloader Service â€” yt-dlp HTTP wrapper for age-restricted Instagram content.
+// IG Downloader Service — yt-dlp HTTP wrapper for age-restricted Instagram content.
 // Deploy on Render (Pro plan). Called by Base44 backend functions as the
 // age-restricted fallback when SMVD + Apify both fail.
 //
 // POST /fetch
 //   { url: "https://www.instagram.com/reel/...", cookie: "sessionid=..." }
-//   â†’ { platform, source_url, video_url, thumbnail_url, caption, title, duration, author, slides: [] }
-//   â†’ { error: "..." } on failure (422)
+//   → { platform, source_url, video_url, thumbnail_url, caption, title, duration, author, slides: [] }
+//   → { error: "..." } on failure (422)
 
 const express = require('express');
 const { execFile } = require('child_process');
@@ -53,11 +53,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// Rate limiting: 200 requests per hour per IP. Covers 3 admins Ã— 30 URLs
+// Rate limiting: 200 requests per hour per IP. Covers 3 admins × 30 URLs
 // with headroom. In-memory (fine for a single-instance Render service).
 const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
-const rateBuckets = new Map(); // ip â†’ { count, resetAt }
+const rateBuckets = new Map(); // ip → { count, resetAt }
 
 app.use((req, res, next) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
@@ -116,7 +116,7 @@ app.post('/fetch', async (req, res) => {
     let cookieText = cookie.trim();
     // Accept either a raw sessionid value or a full Netscape cookie file.
     if (!cookieText.startsWith('# Netscape')) {
-      // Assume it's a sessionid value â€” wrap it in Netscape format.
+      // Assume it's a sessionid value — wrap it in Netscape format.
       const sessionid = cookieText.replace(/^sessionid\s*=\s*/i, '');
       cookieText = [
         '# Netscape HTTP Cookie File',
@@ -189,14 +189,14 @@ app.post('/fetch', async (req, res) => {
 // this endpoint downloads both, scales the PNG to the video dimensions,
 // overlays it, and streams the burned MP4 back. Used by the burnReelOverlay
 // backend function so the reel export ships with the text overlay actually
-// IN the video â€” the client-side canvas bake only produces a still cover.
+// IN the video — the client-side canvas bake only produces a still cover.
 const ALLOWED_BURN_HOSTS = (h) => {
   const x = (h || '').toLowerCase();
   return x.endsWith('base44.app') || x.endsWith('wixstatic.com') || x === 'media.base44.com';
 };
 
 // Stream the download to disk chunk-by-chunk. NEVER buffer a whole media
-// file in RAM â€” a single 50MB reel previously allocated ~100MB (arrayBuffer
+// file in RAM — a single 50MB reel previously allocated ~100MB (arrayBuffer
 // copy + Buffer copy) and a few concurrent requests OOM'd the Render
 // instance. AbortSignal guards against a hung download holding an ffmpeg
 // slot forever.
@@ -568,6 +568,181 @@ app.post('/extract-frame', async (req, res) => {
   }
 });
 
+// --- Grounding Gate + image utilities (L0 / AR gate) ---
+// /probe-frames : download a video, sha256 the bytes, ffprobe it, extract N
+//                 deterministic evenly-spaced frames and hash each. analyzeAsset's
+//                 L0 grounding gate calls this - no LLM runs without real frames.
+// /crop-image   : center-crop an image to a target aspect ratio (carousel AR gate).
+// /probe-image  : return width/height/codec for an image URL (carousel AR gate).
+// All three reuse the streamed downloader + the FFMPEG_MAX_CONCURRENT slot guard.
+const ALLOWED_PROBE_HOSTS = (h) => {
+  const x = (h || '').toLowerCase();
+  return x.endsWith('base44.app') || x.endsWith('wixstatic.com') || x === 'media.base44.com' ||
+         x.endsWith('.cdninstagram.com') || x.endsWith('.fbcdn.net');
+};
+
+function probeFull(file) {
+  return new Promise((resolve) => {
+    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'format=duration:stream=width,height,codec_name', '-of', 'json', file], (err, stdout) => {
+      if (err) return resolve({ duration: null, width: null, height: null, codec: null });
+      try {
+        const data = JSON.parse(stdout);
+        const format = data.format || {};
+        const stream = (data.streams || [])[0] || {};
+        resolve({
+          duration: parseFloat(format.duration) || null,
+          width: stream.width || null,
+          height: stream.height || null,
+          codec: stream.codec_name || null,
+        });
+      } catch {
+        resolve({ duration: null, width: null, height: null, codec: null });
+      }
+    });
+  });
+}
+
+function sha256File(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
+app.post('/probe-frames', async (req, res) => {
+  const { video_url } = req.body || {};
+  if (!video_url) return res.status(400).json({ error: 'video_url is required' });
+  let vUrl;
+  try { vUrl = new URL(video_url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  if (!ALLOWED_PROBE_HOSTS(vUrl.hostname)) {
+    return res.status(403).json({ error: 'Blocked: host not allowed for probe-frames (' + vUrl.hostname + ')' });
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'probe-'));
+  await acquireFfmpegSlot();
+  const videoFile = path.join(dir, 'in.mp4');
+  try {
+    await downloadToFile(video_url, videoFile);
+    if (!fs.existsSync(videoFile) || fs.statSync(videoFile).size === 0) {
+      return res.json({ ok: false, error: 'downloaded file is empty', frames: [], frame_count: 0 });
+    }
+    const input_sha256 = await sha256File(videoFile);
+    const ffprobe = await probeFull(videoFile);
+    if (!ffprobe.duration || ffprobe.duration <= 0) {
+      return res.json({ ok: false, error: 'ffprobe could not determine duration', input_sha256, ffprobe, frames: [], frame_count: 0 });
+    }
+    // Frame count is a fixed function of duration (8 for <=12s, 12 for <=30s,
+    // 16 above) at evenly spaced timestamps, so the same input always yields a
+    // byte-identical frame set.
+    const dur = ffprobe.duration;
+    const frameCount = dur <= 12 ? 8 : dur <= 30 ? 12 : 16;
+    const timestamps = [];
+    for (let i = 0; i < frameCount; i++) timestamps.push(dur * (i + 1) / (frameCount + 1));
+    const frames = [];
+    for (let i = 0; i < timestamps.length; i++) {
+      const ts = timestamps[i];
+      const frameFile = path.join(dir, 'frame_' + String(i).padStart(3, '0') + '.jpg');
+      try {
+        await runFfmpeg(['-y', '-ss', ts.toFixed(3), '-i', videoFile, '-frames:v', '1', '-q:v', '2', frameFile]);
+        if (fs.existsSync(frameFile) && fs.statSync(frameFile).size > 0) {
+          frames.push({ timestamp: ts, sha256: await sha256File(frameFile) });
+        }
+      } catch (e) { /* frame failed at this timestamp - skip, continue */ }
+    }
+    return res.json({
+      ok: frames.length > 0,
+      input_sha256,
+      ffprobe,
+      frames,
+      frame_count: frames.length,
+      frame_count_requested: frameCount,
+      timestamps_requested: timestamps,
+    });
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'probe-frames failed' });
+  } finally {
+    releaseFfmpegSlot();
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
+// POST /crop-image { image_url, target_ar } -> image/jpeg (center crop to target_ar).
+// Response headers X-Output-Width / X-Output-Height report the cropped size.
+app.post('/crop-image', async (req, res) => {
+  const { image_url, target_ar } = req.body || {};
+  if (!image_url || typeof target_ar !== 'number' || !(target_ar > 0)) {
+    return res.status(400).json({ error: 'image_url and target_ar (number > 0) are required' });
+  }
+  let pUrl;
+  try { pUrl = new URL(image_url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  if (!ALLOWED_PROBE_HOSTS(pUrl.hostname)) {
+    return res.status(403).json({ error: 'Blocked: host not allowed for crop-image (' + pUrl.hostname + ')' });
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crop-img-'));
+  await acquireFfmpegSlot();
+  const inFile = path.join(dir, 'in.jpg');
+  const outFile = path.join(dir, 'out.jpg');
+  try {
+    await downloadToFile(image_url, inFile);
+    const probe = await probeFull(inFile);
+    if (!probe.width || !probe.height) {
+      return res.status(500).json({ error: 'Could not probe image dimensions' });
+    }
+    const srcAR = probe.width / probe.height;
+    let cropW, cropH, cropX, cropY;
+    if (srcAR > target_ar) {
+      cropH = probe.height;
+      cropW = Math.round(probe.height * target_ar);
+      cropX = Math.round((probe.width - cropW) / 2);
+      cropY = 0;
+    } else {
+      cropW = probe.width;
+      cropH = Math.round(probe.width / target_ar);
+      cropX = 0;
+      cropY = Math.round((probe.height - cropH) / 2);
+    }
+    await runFfmpeg(['-y', '-i', inFile, '-vf', 'crop=' + cropW + ':' + cropH + ':' + cropX + ':' + cropY, '-q:v', '2', outFile]);
+    const stat = fs.statSync(outFile);
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('X-Output-Width', String(cropW));
+    res.setHeader('X-Output-Height', String(cropH));
+    await pipeline(fs.createReadStream(outFile), res);
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'crop-image failed' });
+  } finally {
+    releaseFfmpegSlot();
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
+// POST /probe-image { image_url } -> { ok, width, height, codec }
+app.post('/probe-image', async (req, res) => {
+  const { image_url } = req.body || {};
+  if (!image_url) return res.status(400).json({ error: 'image_url is required' });
+  let pUrl;
+  try { pUrl = new URL(image_url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  if (!ALLOWED_PROBE_HOSTS(pUrl.hostname)) {
+    return res.status(403).json({ error: 'Blocked: host not allowed for probe-image (' + pUrl.hostname + ')' });
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'probe-img-'));
+  const imgFile = path.join(dir, 'img');
+  try {
+    await downloadToFile(image_url, imgFile);
+    if (!fs.existsSync(imgFile) || fs.statSync(imgFile).size === 0) {
+      return res.json({ ok: false, error: 'downloaded file is empty' });
+    }
+    const probe = await probeFull(imgFile);
+    return res.json({ ok: !!(probe.width && probe.height), width: probe.width, height: probe.height, codec: probe.codec });
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'probe-image failed' });
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
 // --- Identity model proxy ---
 // Proxy /verify-arcface and /verify-adaface to the Flask identity models
 // app running on port 5001 (started alongside this Express server by the
@@ -591,7 +766,7 @@ async function proxyToFlask(req, res, path) {
     } catch {
       // Flask returned non-JSON (HTML error page). Include diagnostic info:
       // the Flask HTTP status, content-type, and a sanitized snippet of
-      // the response body (last 800 chars â€” where the Python traceback is).
+      // the response body (last 800 chars — where the Python traceback is).
       // Strip any line that might contain secrets (admin-secret headers).
       const rawSnippet = text.slice(-800)
         .split('\n')
@@ -612,9 +787,14 @@ async function proxyToFlask(req, res, path) {
 app.post('/verify-arcface', (req, res) => proxyToFlask(req, res, '/verify-arcface'));
 app.post('/verify-adaface', (req, res) => proxyToFlask(req, res, '/verify-adaface'));
 app.post('/verify-identity', (req, res) => proxyToFlask(req, res, '/verify-identity'));
+app.post('/detect-face', (req, res) => proxyToFlask(req, res, '/detect-face'));
 
-// Health check for Render.
-app.get('/health', (req, res) => res.json({ status: 'ok', models: 'arcface,adaface,proxy' }));
+// Health check for Render. Lists the live routes and the deployed git commit so a
+// deploy can be verified from outside (RENDER_GIT_COMMIT is set by Render).
+app.get('/health', (req, res) => {
+  const routes = app._router.stack.filter((l) => l.route).map((l) => Object.keys(l.route.methods)[0].toUpperCase() + ' ' + l.route.path);
+  res.json({ status: 'ok', models: 'arcface,adaface,proxy', commit: process.env.RENDER_GIT_COMMIT || null, routes });
+});
 
 app.listen(PORT, () => {
   console.log(`IG Downloader service listening on port ${PORT}`);

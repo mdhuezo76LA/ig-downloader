@@ -533,6 +533,84 @@ app.post('/stitch', async (req, res) => {
   }
 });
 
+// --- Extract audio from a video (ffmpeg) ---
+// Path B voice chain step 1: extract the audio track from a rendered MP4 as
+// MP3 (libmp3lame, 128k). The caller (runPathBVoiceChain) receives the stream
+// and passes the bytes to ElevenLabs speech-to-speech. Only Base44/Wix storage
+// URLs are accepted (SSRF guard). ticket 6ac306fe7a7ca2068af5fcd5
+app.post('/extract-audio', async (req, res) => {
+  const { video_url } = req.body || {};
+  if (!video_url) return res.status(400).json({ error: 'video_url is required' });
+  let vUrl;
+  try { vUrl = new URL(video_url); }
+  catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  if (!ALLOWED_BURN_HOSTS(vUrl.hostname)) {
+    return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'extaud-'));
+  await acquireFfmpegSlot();
+  const inFile = path.join(dir, 'in.mp4');
+  const outFile = path.join(dir, 'out.mp3');
+  try {
+    await downloadToFile(video_url, inFile);
+    await runFfmpeg([
+      '-y', '-i', inFile,
+      '-vn', '-acodec', 'libmp3lame', '-b:a', '128k', '-ar', '44100',
+      outFile,
+    ]);
+    const stat = fs.statSync(outFile);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', stat.size);
+    await pipeline(fs.createReadStream(outFile), res);
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'extract-audio failed' });
+  } finally {
+    releaseFfmpegSlot();
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
+// --- Remux video with a new audio track (ffmpeg) ---
+// Path B voice chain step 3: replace the audio track of a video with the
+// STS-converted audio. -map 0:v -map 1:a -c:v copy -c:a aac preserves the
+// video frames exactly (no re-encode) and encodes the new audio as AAC.
+// The caller receives the final MP4 stream and uploads it to Base44 storage.
+app.post('/remux-audio', async (req, res) => {
+  const { video_url, audio_url } = req.body || {};
+  if (!video_url || !audio_url) return res.status(400).json({ error: 'video_url and audio_url are required' });
+  let vUrl, aUrl;
+  try { vUrl = new URL(video_url); aUrl = new URL(audio_url); }
+  catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  if (!ALLOWED_BURN_HOSTS(vUrl.hostname) || !ALLOWED_BURN_HOSTS(aUrl.hostname)) {
+    return res.status(403).json({ error: 'Blocked: only Base44/Wix storage URLs allowed' });
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remux-'));
+  await acquireFfmpegSlot();
+  const videoFile = path.join(dir, 'video.mp4');
+  const audioFile = path.join(dir, 'audio.mp3');
+  const outFile = path.join(dir, 'out.mp4');
+  try {
+    await downloadToFile(video_url, videoFile);
+    await downloadToFile(audio_url, audioFile);
+    await runFfmpeg([
+      '-y', '-i', videoFile, '-i', audioFile,
+      '-map', '0:v', '-map', '1:a',
+      '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
+      '-movflags', '+faststart',
+      outFile,
+    ]);
+    const stat = fs.statSync(outFile);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', stat.size);
+    await pipeline(fs.createReadStream(outFile), res);
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'remux-audio failed' });
+  } finally {
+    releaseFfmpegSlot();
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
 // --- Extract a single frame from a video (ffmpeg) ---
 // Extracts a frame at a specific timestamp. Used by the Create Test Lane
 // to run identity gates on the final stitched cut.

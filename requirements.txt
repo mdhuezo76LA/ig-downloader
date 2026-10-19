@@ -1,5 +1,5 @@
 flask
-insightface==0.7.3
+insightface==2.1
 onnxruntime
 numpy
 pillow

@@ -1,4 +1,4 @@
-"""InsightFace 0.7.3 inference, without reparsing a 554MB graph at runtime."""
+"""InsightFace 2.1 inference, without reparsing a 554MB graph at runtime."""
 import numpy as np
 from insightface.model_zoo.inswapper import INSwapper
 

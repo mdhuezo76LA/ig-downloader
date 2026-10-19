@@ -28,7 +28,7 @@ RUN mkdir -p /usr/share/fonts/google && \
 RUN pip install --no-cache-dir -U yt-dlp
 
 # Install Python dependencies for identity models (InsightFace + ONNX Runtime, no PyTorch).
-RUN pip install --no-cache-dir flask insightface==0.7.3 onnxruntime numpy pillow requests
+RUN pip install --no-cache-dir flask insightface==2.1 onnxruntime numpy pillow requests
 
 # Pin and verify the FP32 weights at build time. get_model() does NOT
 # automatically download a bare .onnx filename, and runtime downloads are

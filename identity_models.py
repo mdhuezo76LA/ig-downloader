@@ -108,40 +108,14 @@ def get_adaface():
     return _adaface_app
 
 
-# --- Inswapper (pixel-level face swap) ---
-# inswapper_128 is InsightFace's pixel-level face swapper. Unlike the NBP
-# generative approach (which produces a likeness), inswapper performs an
-# actual pixel-level identity transfer: it takes the source image, detects
-# the face, and replaces it with the reference identity's face using a
-# trained GAN encoder. This preserves the exact identity geometry from
-# the reference, reaching ArcFace/AdaFace cosines well above 0.74/0.78.
-#
-# The model (inswapper_128.onnx) is downloaded automatically by insightface
-# on first use. It reuses the same buffalo_l detector for face detection.
-_inswapper_model = None
+# Inswapper weights are baked into the image; load once on first swap, not
+# alongside the recognition packs at startup. Health never triggers a load.
+from inswapper_runtime import get_inswapper, inswapper_status
 
-def _init_inswapper():
-    global _inswapper_model
-    if _inswapper_model is None:
-        try:
-            print('[Inswapper] Loading inswapper_128 model...', flush=True)
-            _inswapper_model = insightface.model_zoo.get_model('inswapper_128.onnx')
-            print('[Inswapper] inswapper_128 loaded successfully', flush=True)
-        except Exception as e:
-            print(f'[Inswapper] WARNING: inswapper_128 failed to load: {e}', flush=True)
-            _inswapper_model = None
-
-def get_inswapper():
-    return _inswapper_model
-
-
-# --- EAGER MODEL INITIALIZATION ---
-# Load ALL models at module load, BEFORE Flask starts accepting requests.
-print('[Init] Eager model initialization starting...', flush=True)
+print('[Init] Recognition model initialization starting...', flush=True)
 _init_arcface()
 _init_adaface()
-_init_inswapper()
-print('[Init] Eager model initialization complete. Ready to serve requests.', flush=True)
+print('[Init] Recognition models ready; inswapper is lazy-loaded.', flush=True)
 
 
 def is_allowed_host(url):
@@ -371,10 +345,8 @@ def face_swap():
     Input: { source_url, reference_url, admin_secret }
     Output: { image_base64: str, face_detected: bool, error: str|null }
 
-    This is a PIXEL-LEVEL swap (not generative) — it preserves the exact
-    identity geometry from the reference, reaching ArcFace/AdaFace cosines
-    well above 0.74/0.78. The NBP generative approach produces a likeness
-    (ArcFace 0.49-0.60); inswapper produces an exact match (0.80+).
+    Identity quality is measured by the unchanged four-reference ensemble
+    gate, never inferred from the engine name or from successful loading.
     """
     if SHARED_SECRET and request.headers.get('X-Admin-Secret') != SHARED_SECRET:
         return jsonify({'error': 'Unauthorized'}), 401
@@ -387,7 +359,8 @@ def face_swap():
 
         swapper = get_inswapper()
         if swapper is None:
-            return jsonify({'error': 'inswapper_128 model not loaded'}), 503
+            return jsonify({'error': 'inswapper_128 model not loaded',
+                            'inswapper': inswapper_status()}), 503
 
         # Download both images (host-allowed).
         try:
@@ -429,6 +402,8 @@ def face_swap():
             'image_base64': image_b64,
             'face_detected': True,
             'faces_swapped': len(source_faces),
+            'model': 'inswapper_128',
+            'inswapper': inswapper_status(),
             'error': None,
         })
     except Exception as e:
@@ -438,11 +413,15 @@ def face_swap():
 
 @app.route('/health', methods=['GET'])
 def health():
+    runtime = inswapper_status()
     return jsonify({
-        'status': 'ok',
-        'models': ['arcface', 'adaface', 'inswapper'],
+        'status': 'ok' if runtime['loaded'] else 'degraded',
+        'models': {'arcface': _arcface_app is not None,
+                   'adaface': _adaface_app is not None,
+                   'inswapper': runtime['loaded']},
         'adaface_degraded': _adaface_degraded,
-        'inswapper_loaded': _inswapper_model is not None,
+        'inswapper_loaded': runtime['loaded'],
+        'inswapper': runtime,
     })
 
 

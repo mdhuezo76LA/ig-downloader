@@ -993,9 +993,25 @@ app.post('/face-swap', (req, res) => proxyToFlask(req, res, '/face-swap'));
 
 // Health check for Render. Lists the live routes and the deployed git commit so a
 // deploy can be verified from outside (RENDER_GIT_COMMIT is set by Render).
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   const routes = app._router.stack.filter((l) => l.route).map((l) => Object.keys(l.route.methods)[0].toUpperCase() + ' ' + l.route.path);
-  res.json({ status: 'ok', models: 'arcface,adaface,proxy', commit: process.env.RENDER_GIT_COMMIT || null, routes });
+  const deployment = { commit: process.env.RENDER_GIT_COMMIT || null, routes };
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const response = await fetch(`http://127.0.0.1:${FLASK_PORT}/health`, {
+      headers: { 'X-Admin-Secret': SHARED_SECRET }, signal: AbortSignal.timeout(3000),
+    });
+    if (!response.ok) throw new Error(`Identity health HTTP ${response.status}`);
+    const identity = await response.json();
+    // Live state from the very same Flask process that handles /face-swap.
+    // HTTP 200 is liveness for media tools; status/flags express readiness.
+    return res.json({ ...deployment, status: identity.status, identity_reachable: true,
+      models: identity.models, inswapper_loaded: identity.inswapper_loaded === true,
+      adaface_degraded: identity.adaface_degraded, inswapper: identity.inswapper });
+  } catch (error) {
+    return res.json({ ...deployment, status: 'degraded', identity_reachable: false,
+      inswapper_loaded: false, identity_error: error.message });
+  }
 });
 
 app.listen(PORT, () => {

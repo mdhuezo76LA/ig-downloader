@@ -64,3 +64,19 @@ def get_inswapper():
             _state.update(error=f'{type(error).__name__}: {error}', traceback=traceback.format_exc()[-2000:])
             _event('failed', error=_state['error'], elapsed_seconds=round(time.monotonic() - started, 3))
         return _model
+
+
+def release_inswapper():
+    """Drop the inswapper ONNX session so its memory is free before the
+    restorer loads. The swapped pixels already live in the caller's numpy
+    array, so releasing the session never corrupts a swap in flight.
+    Used by /face-swap to keep the two heavy models from coexisting (the
+    container is at its memory ceiling). The next swap reloads in ~1s."""
+    global _model
+    with _lock:
+        if _model is None:
+            return False
+        _model = None
+        _event('released', reason='free memory before restorer load')
+        gc.collect()
+        return True

@@ -110,7 +110,8 @@ def get_adaface():
 
 # Inswapper weights are baked into the image; load once on first swap, not
 # alongside the recognition packs at startup. Health never triggers a load.
-from inswapper_runtime import get_inswapper, inswapper_status
+from inswapper_runtime import get_inswapper, inswapper_status, release_inswapper
+from restorer_runtime import get_restorer, release_restorer, restorer_status
 
 print('[Init] Recognition model initialization starting...', flush=True)
 _init_arcface()
@@ -334,19 +335,59 @@ def detect_face():
         return jsonify({'error': f'detect_face_error: {str(e)}', 'traceback': traceback.format_exc()[-500:]}), 500
 
 
+def color_match_face(source_bgr, target_bgr, bbox, blend=0.8):
+    """Match the restored face region's tone/lighting to the source frame so
+    there is no seam at the face boundary. Lab mean-std (Reinhard) transfer of
+    the source face region onto the restored face region, blended through a
+    feathered elliptical mask so restored texture is preserved in the center
+    while the boundary adopts the source lighting."""
+    import cv2
+    x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2 = min(target_bgr.shape[1], x2)
+    y2 = min(target_bgr.shape[0], y2)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return target_bgr
+    src = source_bgr[y1:y2, x1:x2]
+    dst = target_bgr[y1:y2, x1:x2]
+    src_lab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
+    dst_lab = cv2.cvtColor(dst, cv2.COLOR_BGR2LAB).astype(np.float32)
+    out = np.zeros_like(dst_lab)
+    for c in range(3):
+        m_s, s_s = cv2.meanStdDev(src_lab[:, :, c])
+        m_d, s_d = cv2.meanStdDev(dst_lab[:, :, c])
+        s_s = max(float(s_s), 1e-3)
+        s_d = max(float(s_d), 1e-3)
+        ch = (dst_lab[:, :, c] - m_d) * (s_s / s_d) + m_s
+        out[:, :, c] = np.clip(ch, 0, 255)
+    corrected = cv2.cvtColor(out.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    h, w = dst.shape[:2]
+    mask = np.zeros((h, w), np.float32)
+    cv2.ellipse(mask, (w // 2, h // 2), (max(1, w // 2 - 2), max(1, h // 2 - 2)), 0, 0, 360, 1.0, -1)
+    sigma = max(3, min(h, w) // 8)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma)
+    mask = (mask * blend)[..., None]
+    region = dst.astype(np.float32) * (1 - mask) + corrected.astype(np.float32) * mask
+    target_bgr[y1:y2, x1:x2] = np.clip(region, 0, 255).astype(np.uint8)
+    return target_bgr
+
+
 @app.route('/face-swap', methods=['POST'])
 def face_swap():
-    """Pixel-level face swap using InsightFace inswapper_128.
+    """Pixel-level face swap (inswapper_128) + conservative face restoration
+    (GFPGAN) + source-lighting color match.
 
-    Takes a source image and a reference face image, detects the face in
-    the source, and replaces it with the reference identity's face using
-    the inswapper GAN. Returns the swapped image as base64 JPEG.
+    inswapper_128 generates the face at 128x128 and upscales it, so the face
+    region is visibly softer than the surrounding frame. A post-swap
+    restoration pass repairs the 128px upscale at a conservative fidelity
+    weight (RESTORER_WEIGHT, default 0.4) without beautifying, then the face
+    region is color-matched to the source frame's lighting so there is no
+    tone seam. Both the inswapper and the restorer are lazy-loaded and
+    released around the call to respect the 2GB container memory ceiling.
 
     Input: { source_url, reference_url, admin_secret }
-    Output: { image_base64: str, face_detected: bool, error: str|null }
-
-    Identity quality is measured by the unchanged four-reference ensemble
-    gate, never inferred from the engine name or from successful loading.
+    Output: { image_base64, face_detected, faces_swapped, model,
+              restoration_applied, restorer_weight, restorer, inswapper, error }
     """
     if SHARED_SECRET and request.headers.get('X-Admin-Secret') != SHARED_SECRET:
         return jsonify({'error': 'Unauthorized'}), 401
@@ -362,7 +403,6 @@ def face_swap():
             return jsonify({'error': 'inswapper_128 model not loaded',
                             'inswapper': inswapper_status()}), 503
 
-        # Download both images (host-allowed).
         try:
             source_img = download_image(source_url)
         except Exception as e:
@@ -387,10 +427,49 @@ def face_swap():
             return jsonify({'error': 'no face detected in source image', 'face_detected': False}), 400
 
         # Swap ALL detected faces in the source with the reference identity.
-        # For a single-subject reel frame, this is typically one face.
         result_bgr = source_bgr.copy()
         for face in source_faces:
             result_bgr = swapper.get(result_bgr, face, ref_face, paste_back=True)
+
+        # Largest source face bbox (original image coords) for color match.
+        largest_src = max(source_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        src_bbox = list(largest_src.bbox)
+
+        # Release the inswapper session BEFORE loading the restorer so the two
+        # heavy models never coexist (the container is at its memory ceiling).
+        # The swapped pixels are already in result_bgr.
+        release_inswapper()
+
+        # Conservative face restoration: repair the 128px upscale without
+        # beautifying. RESTORER_WEIGHT (0.4) keeps the result faithful to the
+        # swapped face while fixing softness. If the restorer fails to load,
+        # return the un-restored swap rather than failing the whole call.
+        restoration_applied = False
+        restorer_error = None
+        restorer_enabled = os.environ.get('RESTORER_ENABLED', 'true').lower() == 'true'
+        if restorer_enabled:
+            restorer = get_restorer()
+            if restorer is not None:
+                try:
+                    weight = float(os.environ.get('RESTORER_WEIGHT', '0.4'))
+                    _, _, restored_bgr = restorer.enhance(
+                        result_bgr, paste_back=True, has_aligned=False,
+                        only_center_face=False, weight=weight)
+                    if restored_bgr is not None:
+                        result_bgr = restored_bgr
+                        restoration_applied = True
+                except Exception as re:
+                    restorer_error = f'{type(re).__name__}: {re}'
+            else:
+                restorer_error = 'restorer model not loaded'
+            release_restorer()
+
+        # Color-match the face region to the source frame's lighting so the
+        # restored face does not read as a tone-separate patch.
+        try:
+            result_bgr = color_match_face(source_bgr, result_bgr, src_bbox, blend=0.8)
+        except Exception as ce:
+            print(f'[FaceSwap] color_match skipped: {ce}', flush=True)
 
         # Encode the result as base64 JPEG.
         result_rgb = Image.fromarray(result_bgr[:, :, ::-1])
@@ -403,6 +482,10 @@ def face_swap():
             'face_detected': True,
             'faces_swapped': len(source_faces),
             'model': 'inswapper_128',
+            'restoration_applied': restoration_applied,
+            'restorer_weight': float(os.environ.get('RESTORER_WEIGHT', '0.4')),
+            'restorer_error': restorer_error,
+            'restorer': restorer_status(),
             'inswapper': inswapper_status(),
             'error': None,
         })
@@ -414,14 +497,18 @@ def face_swap():
 @app.route('/health', methods=['GET'])
 def health():
     runtime = inswapper_status()
+    rest = restorer_status()
     return jsonify({
         'status': 'ok' if runtime['loaded'] else 'degraded',
         'models': {'arcface': _arcface_app is not None,
                    'adaface': _adaface_app is not None,
-                   'inswapper': runtime['loaded']},
+                   'inswapper': runtime['loaded'],
+                   'restorer': rest['loaded']},
         'adaface_degraded': _adaface_degraded,
         'inswapper_loaded': runtime['loaded'],
         'inswapper': runtime,
+        'restorer_loaded': rest['loaded'],
+        'restorer': rest,
     })
 
 

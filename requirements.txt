@@ -4,3 +4,12 @@ onnxruntime
 numpy
 pillow
 requests
+# Post-swap face restoration. torch + torchvision are installed from the CPU
+# wheel index in the Dockerfile (before gfpgan) to avoid the ~2GB CUDA wheel.
+torch
+torchvision
+gfpgan
+basicsr
+facexlib
+opencv-python
+scipy

@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     fonts-dejavu \
     fontconfig \
+    libgl1 \
+    libglib2.0-0 \
   && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
   && apt-get install -y --no-install-recommends nodejs \
   && rm -rf /var/lib/apt/lists/*
@@ -43,6 +45,20 @@ RUN mkdir -p /opt/models && \
 RUN python -c "import onnx, numpy as np; m = onnx.load('/opt/models/inswapper_128.onnx'); np.save('/opt/models/inswapper_128.emap.npy', onnx.numpy_helper.to_array(m.graph.initializer[-1]))"
 ENV INSWAPPER_MODEL_PATH=/opt/models/inswapper_128.onnx
 
+# Face restoration (GFPGAN) to repair the 128px inswapper upscale without
+# beautifying. CPU-only torch is installed FIRST from the CPU wheel index so
+# gfpgan does not pull the ~2GB CUDA wheel. opencv-python needs libGL (above).
+RUN pip install --no-cache-dir torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir gfpgan scipy
+# GFPGANv1.4 weights (348MB). Downloaded at build time so a swap never waits
+# on a network fetch; the restorer is lazy-loaded only during a swap call.
+RUN curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 \
+      -o /opt/models/GFPGANv1.4.pth \
+      "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth" && \
+    test -s /opt/models/GFPGANv1.4.pth
+ENV GFPGAN_WEIGHTS_PATH=/opt/models/GFPGANv1.4.pth
+ENV RESTORER_WEIGHT=0.4
+
 # Verify yt-dlp is on PATH.
 RUN yt-dlp --version
 
@@ -54,6 +70,7 @@ COPY server.js ./
 COPY identity_models.py ./
 COPY inswapper_runtime.py ./
 COPY inswapper_loader.py ./
+COPY restorer_runtime.py ./
 
 RUN npm install --omit=dev
 

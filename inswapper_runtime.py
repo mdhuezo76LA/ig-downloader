@@ -21,10 +21,17 @@ def _event(state, **details):
 def inswapper_status():
     with open('/proc/self/statm') as memory:
         rss_mb = round(int(memory.read().split()[1]) * os.sysconf('SC_PAGE_SIZE') / 1048576, 1)
+    memory = {}
+    for name, path in [('container_limit_mb', '/sys/fs/cgroup/memory.max'),
+                       ('container_used_mb', '/sys/fs/cgroup/memory.current')]:
+        if os.path.isfile(path):
+            with open(path) as source:
+                value = source.read().strip()
+                memory[name] = round(int(value) / 1048576, 1) if value.isdigit() else None
     return {**_state, 'loaded': _model is not None, 'pid': os.getpid(),
             'model_path': MODEL_PATH, 'weights_present': os.path.isfile(MODEL_PATH),
             'weights_bytes': os.path.getsize(MODEL_PATH) if os.path.isfile(MODEL_PATH) else 0,
-            'rss_mb': rss_mb}
+            'rss_mb': rss_mb, **memory}
 
 
 def get_inswapper():
@@ -38,7 +45,7 @@ def get_inswapper():
             if not os.path.isfile(MODEL_PATH):
                 raise FileNotFoundError(f'inswapper weights missing: {MODEL_PATH}')
             import onnxruntime as ort
-            from insightface.model_zoo.inswapper import INSwapper
+            from inswapper_loader import BakedINSwapper
             options = ort.SessionOptions()
             options.intra_op_num_threads = 1
             options.inter_op_num_threads = 1
@@ -46,7 +53,7 @@ def get_inswapper():
             options.enable_mem_pattern = False
             options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
             session = ort.InferenceSession(MODEL_PATH, sess_options=options, providers=['CPUExecutionProvider'])
-            model = INSwapper(model_file=MODEL_PATH, session=session)
+            model = BakedINSwapper(model_file=MODEL_PATH, session=session)
             if model is None or not callable(getattr(model, 'get', None)):
                 raise RuntimeError('Loader returned no usable inswapper model')
             _model = model

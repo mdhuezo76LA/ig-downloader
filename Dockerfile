@@ -28,7 +28,7 @@ RUN mkdir -p /usr/share/fonts/google && \
 RUN pip install --no-cache-dir -U yt-dlp
 
 # Install Python dependencies for identity models (InsightFace + ONNX Runtime, no PyTorch).
-RUN pip install --no-cache-dir flask insightface onnxruntime numpy pillow requests
+RUN pip install --no-cache-dir flask insightface==0.7.3 onnxruntime numpy pillow requests
 
 # Pin and verify the FP32 weights at build time. get_model() does NOT
 # automatically download a bare .onnx filename, and runtime downloads are
@@ -38,6 +38,9 @@ RUN mkdir -p /opt/models && \
       -o /opt/models/inswapper_128.onnx \
       "https://huggingface.co/Aitrepreneur/insightface/resolve/fd887cdef0c73f32251198b8160d6771ac413fc0/inswapper_128.onnx" && \
     echo "e4a3f08c753cb72d04e10aa0f7dbe3deebbf39567d4ead6dce08e98aa49e16af  /opt/models/inswapper_128.onnx" | sha256sum -c -
+# INSwapper.__init__ reparses the entire 554MB ONNX just to read this 1MB
+# matrix. Extract it in the build, never duplicate the full graph at runtime.
+RUN python -c "import onnx, numpy as np; m = onnx.load('/opt/models/inswapper_128.onnx'); np.save('/opt/models/inswapper_128.emap.npy', onnx.numpy_helper.to_array(m.graph.initializer[-1]))"
 ENV INSWAPPER_MODEL_PATH=/opt/models/inswapper_128.onnx
 
 # Verify yt-dlp is on PATH.
@@ -50,6 +53,7 @@ COPY package.json ./
 COPY server.js ./
 COPY identity_models.py ./
 COPY inswapper_runtime.py ./
+COPY inswapper_loader.py ./
 
 RUN npm install --omit=dev
 

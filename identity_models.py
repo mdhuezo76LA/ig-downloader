@@ -63,7 +63,7 @@ def _init_arcface():
     global _arcface_app
     if _arcface_app is None:
         print('[ArcFace] Loading buffalo_l pack (w600k_r50 ResNet50)...', flush=True)
-        _arcface_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+        _arcface_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'recognition'], providers=['CPUExecutionProvider'])
         _arcface_app.prepare(ctx_id=-1, det_size=(640, 640))
         print('[ArcFace] buffalo_l loaded successfully', flush=True)
 
@@ -95,7 +95,7 @@ def _init_adaface():
     if _adaface_app is None:
         try:
             print('[AdaFace] Loading buffalo_s pack (w600k_mbf MobileFaceNet)...', flush=True)
-            _adaface_app = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider'])
+            _adaface_app = FaceAnalysis(name='buffalo_s', allowed_modules=['detection', 'recognition'], providers=['CPUExecutionProvider'])
             _adaface_app.prepare(ctx_id=-1, det_size=(640, 640))
             print('[AdaFace] buffalo_s loaded successfully — independent ensemble vote active', flush=True)
         except Exception as e:

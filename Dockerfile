@@ -1,4 +1,4 @@
-# IG Downloader + Identity Models Service â€” yt-dlp + Node + Python on Render.
+# IG Downloader + Identity Models Service — yt-dlp + Node + Python on Render.
 # Base: Python image (yt-dlp is Python, identity models need Python).
 # Node is installed on top for the Express server.
 

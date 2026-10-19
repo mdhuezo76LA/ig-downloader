@@ -183,6 +183,98 @@ app.post('/fetch', async (req, res) => {
   }
 });
 
+// --- DASH merge: download bestvideo+bestaudio and merge into one MP4 ---
+// For DASH-separated sources (FB, YouTube, etc.), the primary fetcher may
+// grab a video-only stream and drop the audio. This endpoint uses yt-dlp
+// with -f 'bv*+ba/b' --merge-output-format mp4 to merge the best video +
+// best audio streams into a single MP4, then streams it back. The caller
+// uploads the stream to Base44 storage. Milton 2026-10-07: FB reels are
+// DASH-separated — the Apify actor grabs a video-only stream and drops the
+// audio-only m4a stream.
+app.post('/fetch-merged', async (req, res) => {
+  const { url, cookie } = req.body || {};
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url is required' });
+  }
+
+  // SSRF protection: allow social media hosts (IG, FB, TikTok, YouTube).
+  let parsedUrl;
+  try { parsedUrl = new URL(url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  const host = parsedUrl.hostname.toLowerCase();
+  const allowed = host.includes('instagram.com') || host.includes('facebook.com') ||
+                  host.includes('fb.watch') || host.includes('tiktok.com') ||
+                  host.includes('youtube.com') || host.includes('youtu.be');
+  if (!allowed) {
+    return res.status(403).json({ error: `Blocked: only social media URLs are allowed (got ${host})` });
+  }
+  if (parsedUrl.protocol !== 'https:') {
+    return res.status(400).json({ error: 'Only HTTPS URLs are allowed' });
+  }
+
+  // Write the cookie to a temp Netscape-format file if provided.
+  let cookieFile = null;
+  if (cookie && typeof cookie === 'string' && cookie.trim()) {
+    cookieFile = path.join(os.tmpdir(), `ig-cookies-${crypto.randomUUID()}.txt`);
+    let cookieText = cookie.trim();
+    if (!cookieText.startsWith('# Netscape')) {
+      // Raw session value — convert to Netscape format based on the platform.
+      const isFb = host.includes('facebook.com') || host.includes('fb.watch');
+      if (isFb) {
+        cookieText = [
+          '# Netscape HTTP Cookie File',
+          '# This is a generated file! Do not edit.',
+          '',
+          '.facebook.com\tTRUE\t/\tTRUE\t0\txs\t' + cookieText,
+        ].join('\n');
+      } else {
+        const sessionid = cookieText.replace(/^sessionid\s*=\s*/i, '');
+        cookieText = [
+          '# Netscape HTTP Cookie File',
+          '# This is a generated file! Do not edit.',
+          '',
+          '.instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\t' + sessionid,
+        ].join('\n');
+      }
+    }
+    try { fs.writeFileSync(cookieFile, cookieText, { mode: 0o600 }); }
+    catch (e) { return res.status(500).json({ error: `Failed to write cookie file: ${e.message}` }); }
+  }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fetch-merged-'));
+  const outFile = path.join(dir, 'merged.mp4');
+  try {
+    const args = [
+      '-f', 'bv*+ba/b',
+      '--merge-output-format', 'mp4',
+      '-o', outFile,
+      '--no-warnings',
+      '--no-playlist',
+      '--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+    ];
+    if (cookieFile) args.push('--cookies', cookieFile);
+    args.push(url);
+
+    const result = await runYtDlp(args);
+    if (result.error) {
+      return res.status(422).json({ error: `yt-dlp merge failed: ${result.error}`, details: result.stderr });
+    }
+
+    if (!fs.existsSync(outFile) || fs.statSync(outFile).size === 0) {
+      return res.status(422).json({ error: 'yt-dlp completed but no merged file was produced' });
+    }
+
+    const stat = fs.statSync(outFile);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', stat.size);
+    await pipeline(fs.createReadStream(outFile), res);
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'fetch-merged failed' });
+  } finally {
+    if (cookieFile) { try { fs.unlinkSync(cookieFile); } catch { /* best effort */ } }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
 // --- Overlay burn-in (ffmpeg) ---
 // Burn a transparent overlay PNG onto a video. The PNG is pre-rendered
 // client-side (pixel-perfect Google fonts) and uploaded to Base44 storage;
@@ -661,20 +753,23 @@ const ALLOWED_PROBE_HOSTS = (h) => {
 
 function probeFull(file) {
   return new Promise((resolve) => {
-    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'format=duration:stream=width,height,codec_name', '-of', 'json', file], (err, stdout) => {
-      if (err) return resolve({ duration: null, width: null, height: null, codec: null });
+    execFile('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=width,height,codec_name,codec_type', '-of', 'json', file], (err, stdout) => {
+      if (err) return resolve({ duration: null, width: null, height: null, codec: null, has_audio: false });
       try {
         const data = JSON.parse(stdout);
         const format = data.format || {};
-        const stream = (data.streams || [])[0] || {};
+        const streams = data.streams || [];
+        const videoStream = streams.find((s) => s.codec_type === 'video') || streams[0] || {};
+        const hasAudio = streams.some((s) => s.codec_type === 'audio');
         resolve({
           duration: parseFloat(format.duration) || null,
-          width: stream.width || null,
-          height: stream.height || null,
-          codec: stream.codec_name || null,
+          width: videoStream.width || null,
+          height: videoStream.height || null,
+          codec: videoStream.codec_name || null,
+          has_audio: hasAudio,
         });
       } catch {
-        resolve({ duration: null, width: null, height: null, codec: null });
+        resolve({ duration: null, width: null, height: null, codec: null, has_audio: false });
       }
     });
   });
@@ -821,6 +916,34 @@ app.post('/probe-image', async (req, res) => {
   }
 });
 
+// POST /probe-audio { video_url } -> { has_audio: boolean }
+// Lightweight audio track probe — downloads the video and checks for an
+// audio stream via ffprobe. Used by ingestSourceUrl to detect DASH-separated
+// sources where the primary fetcher grabbed a video-only stream.
+app.post('/probe-audio', async (req, res) => {
+  const { video_url } = req.body || {};
+  if (!video_url) return res.status(400).json({ error: 'video_url is required' });
+  let vUrl;
+  try { vUrl = new URL(video_url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  if (!ALLOWED_PROBE_HOSTS(vUrl.hostname)) {
+    return res.status(403).json({ error: 'Blocked: host not allowed for probe-audio (' + vUrl.hostname + ')' });
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'probe-aud-'));
+  const inFile = path.join(dir, 'in.mp4');
+  try {
+    await downloadToFile(video_url, inFile);
+    if (!fs.existsSync(inFile) || fs.statSync(inFile).size === 0) {
+      return res.json({ has_audio: false, error: 'downloaded file is empty' });
+    }
+    const probe = await probeFull(inFile);
+    return res.json({ has_audio: !!probe.has_audio, duration: probe.duration, width: probe.width, height: probe.height });
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ error: e.message || 'probe-audio failed' });
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
 // --- Identity model proxy ---
 // Proxy /verify-arcface and /verify-adaface to the Flask identity models
 // app running on port 5001 (started alongside this Express server by the
@@ -866,6 +989,7 @@ app.post('/verify-arcface', (req, res) => proxyToFlask(req, res, '/verify-arcfac
 app.post('/verify-adaface', (req, res) => proxyToFlask(req, res, '/verify-adaface'));
 app.post('/verify-identity', (req, res) => proxyToFlask(req, res, '/verify-identity'));
 app.post('/detect-face', (req, res) => proxyToFlask(req, res, '/detect-face'));
+app.post('/face-swap', (req, res) => proxyToFlask(req, res, '/face-swap'));
 
 // Health check for Render. Lists the live routes and the deployed git commit so a
 // deploy can be verified from outside (RENDER_GIT_COMMIT is set by Render).

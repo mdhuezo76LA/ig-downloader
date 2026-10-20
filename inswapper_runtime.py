@@ -1,5 +1,6 @@
 """Single lazy CPU session with truthful, retained initialization evidence."""
 import os
+import gc
 import threading
 import time
 import traceback

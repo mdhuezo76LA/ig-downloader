@@ -178,7 +178,7 @@ def extract_adaface_embedding(img_rgb):
 # it: ArcFace measures identity, DINOv2 measures appearance, and the two are not
 # the same quantity in the same units.
 DINOV2_MODEL = 'vit_small_patch14_dinov2.lvd142m'
-DINOV2_CROP_MARGIN = 0.25
+DINOV2_CROP_MARGIN = 0.25  # per side: total crop = 1.50x the long side
 _dinov2_model = None
 _dinov2_tf = None
 _dinov2_error = None
@@ -210,8 +210,12 @@ def dinov2_state():
 
 
 def _face_crop_rgb(img_rgb):
-    """Largest detected face, bbox expanded 25% on the long side, squared,
-    clamped to the frame. Same geometry the face-identity path uses."""
+    """Largest detected face, bbox expanded 25% on EACH side (1.50x the long
+    side: s = max(w,h) * (1 + 2*0.25)), squared, clamped to the frame. Same
+    geometry the face-identity path uses.
+
+    The per-side reading is load-bearing: a 1.25x total crop gives MIRROR_FLASH
+    0.510 instead of 0.526 and looks like a model difference when it is not."""
     app_ = get_arcface()
     img_bgr = np.array(img_rgb)[:, :, ::-1]
     faces = app_.get(img_bgr)

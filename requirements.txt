@@ -13,3 +13,4 @@ basicsr
 facexlib
 opencv-python
 scipy
+timm==1.0.31

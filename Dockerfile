@@ -57,6 +57,15 @@ RUN curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 \
       "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth" && \
     test -s /opt/models/GFPGANv1.4.pth
 ENV GFPGAN_WEIGHTS_PATH=/opt/models/GFPGANv1.4.pth
+
+# DINOv2 ViT-S/14 for the independent appearance instrument (scorer B).
+# timm only; torch and torchvision are already installed above from the CPU
+# wheel index. Weights are baked into the image so a verification call never
+# waits on a Hugging Face fetch.
+ENV HF_HOME=/opt/hf
+RUN pip install --no-cache-dir timm==1.0.31
+RUN python -c "import timm; timm.create_model('vit_small_patch14_dinov2.lvd142m', pretrained=True, num_classes=0); print('DINOv2 weights baked')"
+
 ENV RESTORER_WEIGHT=0.4
 
 # Verify yt-dlp is on PATH.

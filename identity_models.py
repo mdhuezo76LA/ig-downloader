@@ -26,6 +26,7 @@ Models download automatically on first run:
 
 import os
 import io
+import threading
 import base64
 import numpy as np
 import requests
@@ -170,6 +171,80 @@ def extract_adaface_embedding(img_rgb):
     return face.normed_embedding  # 512-dim, L2-normalized
 
 
+
+# --- DINOv2 (independent appearance instrument) ---
+# Different model family from the face-identity models: a general image encoder,
+# not a face-recognition network. Reported alongside ArcFace, never averaged with
+# it: ArcFace measures identity, DINOv2 measures appearance, and the two are not
+# the same quantity in the same units.
+DINOV2_MODEL = 'vit_small_patch14_dinov2.lvd142m'
+DINOV2_CROP_MARGIN = 0.25
+_dinov2_model = None
+_dinov2_tf = None
+_dinov2_error = None
+_dinov2_lock = threading.Lock()
+
+
+def _init_dinov2():
+    global _dinov2_model, _dinov2_tf, _dinov2_error
+    with _dinov2_lock:
+        if _dinov2_model is not None or _dinov2_error is not None:
+            return
+        try:
+            import torch
+            import timm
+            from timm.data import resolve_data_config, create_transform
+            torch.set_grad_enabled(False)
+            m = timm.create_model(DINOV2_MODEL, pretrained=True, num_classes=0).eval()
+            _dinov2_tf = create_transform(**resolve_data_config(m.pretrained_cfg, model=m))
+            _dinov2_model = m
+            print('[DINOv2] loaded ' + DINOV2_MODEL, flush=True)
+        except Exception as e:
+            _dinov2_error = str(e)[:300]
+            print('[DINOv2] load failed: ' + _dinov2_error, flush=True)
+
+
+def dinov2_state():
+    _init_dinov2()
+    return {'model': DINOV2_MODEL, 'ready': _dinov2_model is not None, 'error': _dinov2_error}
+
+
+def _face_crop_rgb(img_rgb):
+    """Largest detected face, bbox expanded 25% on the long side, squared,
+    clamped to the frame. Same geometry the face-identity path uses."""
+    app_ = get_arcface()
+    img_bgr = np.array(img_rgb)[:, :, ::-1]
+    faces = app_.get(img_bgr)
+    if len(faces) == 0:
+        return None
+    f = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
+    x1, y1, x2, y2 = f.bbox
+    w, h = x2 - x1, y2 - y1
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    s = max(w, h) * (1 + 2 * DINOV2_CROP_MARGIN)
+    H, W = img_bgr.shape[:2]
+    X1, Y1 = int(max(0, cx - s / 2)), int(max(0, cy - s / 2))
+    X2, Y2 = int(min(W, cx + s / 2)), int(min(H, cy + s / 2))
+    if X2 <= X1 or Y2 <= Y1:
+        return None
+    return img_rgb.crop((X1, Y1, X2, Y2))
+
+
+def extract_dinov2_embedding(img_rgb):
+    _init_dinov2()
+    if _dinov2_model is None:
+        return None
+    crop = _face_crop_rgb(img_rgb)
+    if crop is None:
+        return None
+    import torch
+    x = _dinov2_tf(crop).unsqueeze(0)
+    with torch.no_grad():
+        v = _dinov2_model(x)[0].numpy()
+    n = float(np.linalg.norm(v))
+    return v / n if n else v
+
+
 def verify_embeddings(candidate_url, reference_urls, extract_fn, threshold):
     """Common verification logic: extract embeddings, compute cosine, return verdict."""
     try:
@@ -199,12 +274,12 @@ def verify_embeddings(candidate_url, reference_urls, extract_fn, threshold):
 
     valid_scores = [s['score'] for s in scores if s.get('face_detected')]
     best_cosine = max(valid_scores) if valid_scores else 0.0
-    verdict = best_cosine >= threshold
+    verdict = None if threshold is None else bool(best_cosine >= threshold)
 
     return {
         'cosine_scores': scores,
         'best_cosine': round(best_cosine, 4),
-        'verdict': bool(verdict),
+        'verdict': verdict,
         'threshold': threshold,
         'face_detected': True,
         'error': None,
@@ -276,6 +351,95 @@ def test_adaface():
         tb = traceback.format_exc()
         print(f'[AdaFace] /test-adaface EXCEPTION: {e}', flush=True)
         return jsonify({'status': 'error', 'error': str(e), 'traceback': tb[-500:]}), 500
+
+
+
+@app.route('/verify-dinov2', methods=['POST'])
+def verify_dinov2():
+    """DINOv2 ViT-S/14 appearance cosine. No threshold: uncalibrated, reported only."""
+    if SHARED_SECRET and request.headers.get('X-Admin-Secret') != SHARED_SECRET:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json() or {}
+    candidate_url = (data.get('candidate_url') or '').strip()
+    reference_urls = data.get('reference_urls') or []
+    if not candidate_url or not reference_urls:
+        return jsonify({'error': 'candidate_url and reference_urls required'}), 400
+    st = dinov2_state()
+    if not st['ready']:
+        return jsonify({'error': 'dinov2_unavailable', 'detail': st['error']}), 503
+    res = verify_embeddings(candidate_url, reference_urls, extract_dinov2_embedding, None)
+    res['threshold'] = None
+    res['verdict'] = None
+    res['instrument'] = st
+    return jsonify(res)
+
+
+@app.route('/verify-identity-v2', methods=['POST'])
+def verify_identity_v2():
+    """Two independent instruments reported side by side, never averaged.
+
+    arcface  face-identity cosine, w600k_r50, threshold 0.74 = high-confidence flag
+    dinov2   appearance cosine, ViT-S/14, threshold uncalibrated, reported only
+    idgb     110.6 * arcface, the scale the per-cell floors were fitted on
+    floor    optional per-cell floor on the IDGB scale; verdict FLOOR_PASS/BELOW_FLOOR
+             when supplied, otherwise SCORED
+    The scorer-spread rule is retired. 'agreement' is informational and no verdict
+    may cite scorer disagreement.
+    """
+    if SHARED_SECRET and request.headers.get('X-Admin-Secret') != SHARED_SECRET:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json() or {}
+    candidate_url = (data.get('candidate_url') or '').strip()
+    reference_urls = data.get('reference_urls') or []
+    floor = data.get('floor')
+    if not candidate_url or not reference_urls:
+        return jsonify({'error': 'candidate_url and reference_urls required'}), 400
+
+    arc = verify_embeddings(candidate_url, reference_urls, extract_arcface_embedding, 0.74)
+    st = dinov2_state()
+    if st['ready']:
+        din = verify_embeddings(candidate_url, reference_urls, extract_dinov2_embedding, None)
+        din['threshold'] = None
+        din['verdict'] = None
+    else:
+        din = {'error': 'dinov2_unavailable', 'detail': st['error'], 'best_cosine': None}
+
+    if not arc.get('face_detected'):
+        return jsonify({'verdict': 'UNSCORED', 'reason': 'no face in candidate',
+                        'arcface': arc, 'dinov2': din, 'spread_rule': 'retired'}), 200
+
+    a = arc['best_cosine']
+    idgb = round(min(100.0, 110.6 * a), 1)
+    d = din.get('best_cosine')
+    if floor is None:
+        verdict = 'SCORED'
+    else:
+        verdict = 'FLOOR_PASS' if idgb >= float(floor) else 'BELOW_FLOOR'
+    # Agreement is only meaningful against a CALIBRATED dinov2 threshold. Until one
+    # exists it is reported as unknown: the retired spread rule is not resurrected
+    # under a new name.
+    dthr = data.get('dinov2_threshold')
+    agreement = 'unknown'
+    if d is not None and dthr is not None:
+        agreement = 'agree' if (a >= 0.74) == (d >= float(dthr)) else 'disagree'
+
+    refs_used = [s for s in arc.get('cosine_scores', []) if s.get('face_detected')]
+    return jsonify({
+        'verdict': verdict,
+        'idgb': idgb,
+        'floor': floor,
+        'arcface': {'best_cosine': a, 'threshold': 0.74, 'high_confidence': bool(a >= 0.74),
+                    'instrument': 'insightface buffalo_l w600k_r50', 'per_ref': arc.get('cosine_scores')},
+        'dinov2': {'best_cosine': d, 'threshold': None, 'instrument': st['model'],
+                   'per_ref': din.get('cosine_scores') if st['ready'] else None,
+                   'note': din.get('error') if not st['ready'] else 'uncalibrated, reported only'},
+        'agreement': agreement,
+        'agreement_is_informational_only': True,
+        'spread_rule': 'retired',
+        'references_used': len(refs_used),
+        'references_undetectable': len(arc.get('cosine_scores', [])) - len(refs_used),
+        'face_detected': True,
+    })
 
 
 @app.route('/detect-face', methods=['POST'])
@@ -492,6 +656,19 @@ def face_swap():
     except Exception as e:
         import traceback
         return jsonify({'error': f'face_swap_error: {str(e)}', 'traceback': traceback.format_exc()[-500:]}), 500
+
+
+
+@app.route('/version', methods=['GET'])
+def version():
+    """Non-sensitive build probe: scorer names and whether DINOv2 loaded."""
+    return jsonify({
+        'service': 'identity-models',
+        'scorers': {'arcface': 'insightface buffalo_l w600k_r50',
+                    'dinov2': DINOV2_MODEL},
+        'dinov2': dinov2_state(),
+        'routes': ['/verify-arcface', '/verify-adaface', '/verify-dinov2', '/verify-identity-v2'],
+    })
 
 
 @app.route('/health', methods=['GET'])

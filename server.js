@@ -39,6 +39,27 @@ const ALLOWED_HOSTS = new Set([
   'www.instagr.am',
 ]);
 
+// Public, non-sensitive build probe, mounted BEFORE the shared-secret gate so a
+// deploy can be verified from outside without holding the middleware secret.
+// Reports the commit and the identity instruments, never a secret.
+const FLASK_VERSION_PORT = process.env.FLASK_PORT || 5001;
+app.get('/version', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  let flask = null;
+  try {
+    const r = await fetch(`http://localhost:${FLASK_VERSION_PORT}/version`);
+    flask = await r.json();
+  } catch (e) {
+    flask = { error: 'flask version probe unavailable' };
+  }
+  res.json({
+    service: 'ig-downloader',
+    commit: process.env.RENDER_GIT_COMMIT || null,
+    identity_v2: true,
+    flask,
+  });
+});
+
 // Simple shared-secret auth. Accept either x-shared-secret (legacy) or
 // X-Admin-Secret (used by the ensemble identity check) so both the IG
 // Downloader endpoints and the proxied identity endpoints work with the
@@ -988,6 +1009,8 @@ async function proxyToFlask(req, res, path) {
 app.post('/verify-arcface', (req, res) => proxyToFlask(req, res, '/verify-arcface'));
 app.post('/verify-adaface', (req, res) => proxyToFlask(req, res, '/verify-adaface'));
 app.post('/verify-identity', (req, res) => proxyToFlask(req, res, '/verify-identity'));
+app.post('/verify-dinov2', (req, res) => proxyToFlask(req, res, '/verify-dinov2'));
+app.post('/verify-identity-v2', (req, res) => proxyToFlask(req, res, '/verify-identity-v2'));
 app.post('/detect-face', (req, res) => proxyToFlask(req, res, '/detect-face'));
 app.post('/face-swap', (req, res) => proxyToFlask(req, res, '/face-swap'));
 
